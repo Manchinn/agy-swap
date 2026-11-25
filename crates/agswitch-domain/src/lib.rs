@@ -3,9 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use agswitch_primitives::{AccountTier, AppError, ModelFamily, RuleId, RuntimeOs};
 use agswitch_spec::{
     AccountProfile, AccountUsageMetrics, ActiveSessionSpan, ExternalAntigravityQuota,
-    ExternalProviderSummary, ExternalTelemetrySnapshot, LaunchSpec, ModelUsageBreakdown,
-    RuleStatus, ServerQuotaBucket, SingleModelUsage, TranscriptFeed, TranscriptStep, UsageLedger,
-    UsageSnapshot,
+    ExternalProviderSummary, ExternalTelemetrySnapshot, FirecrawlDetail, LaunchSpec, MaxPlusDetail,
+    MaxPlusKeyRow, MaxPlusPeriodStat, ModelUsageBreakdown, OpenCodeGoDetail, RuleStatus,
+    ServerQuotaBucket, SingleModelUsage, TokenMeDetail, TranscriptFeed, TranscriptStep,
+    UsageLedger, UsageSnapshot,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -1051,22 +1052,25 @@ pub fn parse_external_telemetry_json(
     }
 
     let mut providers = Vec::new();
+    let mut maxplus_detail = None;
+    let mut opencode_go_detail = None;
+    let mut tokenme_detail = None;
+    let mut firecrawl_detail = None;
 
     // 1. MaxPlus
     if let Some(mp) = obj.get("maxplus").and_then(serde_json::Value::as_object) {
-        let credit = mp
-            .get("credit_usd")
-            .and_then(serde_json::Value::as_f64);
-        let cost_24h = mp
-            .get("periods")
-            .and_then(|p| p.get("24h"))
-            .and_then(|p| p.get("total_cost"))
-            .and_then(serde_json::Value::as_f64);
-        let cost_7d = mp
-            .get("periods")
-            .and_then(|p| p.get("7d"))
-            .and_then(|p| p.get("total_cost"))
-            .and_then(serde_json::Value::as_f64);
+        let detail = parse_maxplus_detail(mp);
+        let credit = mp.get("credit_usd").and_then(serde_json::Value::as_f64);
+        let cost_24h = detail
+            .periods
+            .iter()
+            .find(|p| p.label == "24h")
+            .map(|p| p.total_cost_usd);
+        let cost_7d = detail
+            .periods
+            .iter()
+            .find(|p| p.label == "7d")
+            .map(|p| p.total_cost_usd);
         let keys_count = mp
             .get("keys")
             .and_then(serde_json::Value::as_array)
@@ -1104,56 +1108,36 @@ pub fn parse_external_telemetry_json(
             remaining_percent: rem_pct,
             status_badge: status_badge.to_owned(),
         });
+        if credit.is_some() || !detail.periods.is_empty() || !detail.keys.is_empty() {
+            maxplus_detail = Some(detail);
+        }
     }
 
     // 2. OpenCode Go
     if let Some(oc) = obj.get("opencode_go").and_then(serde_json::Value::as_object) {
-        let ok = oc
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let rolling = oc
-            .get("rolling")
-            .and_then(|r| r.get("percent"))
-            .and_then(serde_json::Value::as_f64);
-        let weekly = oc
-            .get("weekly")
-            .and_then(|r| r.get("percent"))
-            .and_then(serde_json::Value::as_f64);
-        let monthly = oc
-            .get("monthly")
-            .and_then(|r| r.get("percent"))
-            .and_then(serde_json::Value::as_f64);
-        let max_used = [rolling, weekly, monthly]
-            .into_iter()
-            .flatten()
-            .fold(0.0_f64, f64::max);
-        let remaining = if ok {
+        let detail = parse_opencode_go_detail(oc);
+        let max_used = detail
+            .rolling_used_pct
+            .max(detail.weekly_used_pct)
+            .max(detail.monthly_used_pct);
+        let remaining = if detail.ok {
             Some((100.0 - max_used).clamp(0.0, 100.0))
         } else {
             None
         };
-        let headline = if ok {
+        let headline = if detail.ok {
             format!(
                 "5h {:.0}% · Wk {:.0}%",
-                rolling.unwrap_or(0.0),
-                weekly.unwrap_or(0.0)
+                detail.rolling_used_pct, detail.weekly_used_pct
             )
         } else {
             "Offline".to_owned()
         };
-        let total_reqs = oc
-            .get("local_usage")
-            .and_then(|l| l.get("combined"))
-            .and_then(|c| c.get("requests"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
         let subline = format!(
             "Mo {:.0}% used · {} reqs",
-            monthly.unwrap_or(0.0),
-            total_reqs
+            detail.monthly_used_pct, detail.combined_requests
         );
-        let status_badge = if !ok {
+        let status_badge = if !detail.ok {
             "OFF"
         } else if max_used >= 90.0 {
             "LOW"
@@ -1165,37 +1149,25 @@ pub fn parse_external_telemetry_json(
         providers.push(ExternalProviderSummary {
             id: "opencode_go".to_owned(),
             name: "OpenCode Go".to_owned(),
-            ok,
+            ok: detail.ok,
             headline,
             subline,
             remaining_percent: remaining,
             status_badge: status_badge.to_owned(),
         });
+        opencode_go_detail = Some(detail);
     }
 
     // 3. TokenMe
     if let Some(tm) = obj.get("tokenme").and_then(serde_json::Value::as_object) {
-        let elapsed = tm
-            .get("cycle_elapsed_pct")
-            .and_then(serde_json::Value::as_f64)
-            .unwrap_or(0.0)
-            .clamp(0.0, 100.0);
-        let reqs = tm
-            .get("combined_cycle")
-            .and_then(|c| c.get("requests"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let toks = tm
-            .get("combined_cycle")
-            .and_then(|c| c.get("total_tokens"))
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let days_left = tm
-            .get("dec17_days")
-            .and_then(serde_json::Value::as_u64);
-        let headline = format!("Cycle {elapsed:.0}% elapsed");
-        let mut sub = format!("{reqs} reqs · {}", format_tokens(toks));
-        if let Some(d) = days_left {
+        let detail = parse_tokenme_detail(tm);
+        let headline = format!("Cycle {:.0}% elapsed", detail.cycle_elapsed_pct);
+        let mut sub = format!(
+            "{} reqs · {}",
+            detail.cycle_requests,
+            format_tokens(detail.cycle_tokens)
+        );
+        if let Some(d) = detail.days_left {
             sub.push_str(&format!(" · {d}d left"));
         }
         providers.push(ExternalProviderSummary {
@@ -1204,43 +1176,35 @@ pub fn parse_external_telemetry_json(
             ok: true,
             headline,
             subline: sub,
-            remaining_percent: Some((100.0 - elapsed).clamp(0.0, 100.0)),
+            remaining_percent: Some((100.0 - detail.cycle_elapsed_pct).clamp(0.0, 100.0)),
             status_badge: "LIVE".to_owned(),
         });
+        tokenme_detail = Some(detail);
     }
 
     // 4. Firecrawl
     if let Some(fc) = obj.get("firecrawl").and_then(serde_json::Value::as_object) {
-        let ok = fc
-            .get("ok")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        let rem = fc
-            .get("remaining_credits")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        let plan = fc
-            .get("plan_credits")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
+        let detail = parse_firecrawl_detail(fc);
         let rem_pct = fc
             .get("remaining_percent")
             .and_then(serde_json::Value::as_f64)
-            .map(|v| v.clamp(0.0, 100.0));
-        let headline = if ok {
-            format!("{rem} / {plan} credits")
+            .map(|v| v.clamp(0.0, 100.0))
+            .or(if detail.plan_credits > 0 {
+                Some(detail.remaining_percent)
+            } else {
+                None
+            });
+        let headline = if detail.ok {
+            format!("{} / {} credits", detail.remaining_credits, detail.plan_credits)
         } else {
             "Offline".to_owned()
         };
-        let used = fc
-            .get("used_credits")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
         let subline = format!(
-            "{used} used · {:.0}% remaining",
+            "{} used · {:.0}% remaining",
+            detail.used_credits,
             rem_pct.unwrap_or(0.0)
         );
-        let status_badge = if !ok {
+        let status_badge = if !detail.ok {
             "OFF"
         } else if rem_pct.is_some_and(|p| p < 15.0) {
             "LOW"
@@ -1252,12 +1216,13 @@ pub fn parse_external_telemetry_json(
         providers.push(ExternalProviderSummary {
             id: "firecrawl".to_owned(),
             name: "Firecrawl".to_owned(),
-            ok,
+            ok: detail.ok,
             headline,
             subline,
             remaining_percent: rem_pct,
             status_badge: status_badge.to_owned(),
         });
+        firecrawl_detail = Some(detail);
     }
 
     Some(ExternalTelemetrySnapshot {
@@ -1268,7 +1233,267 @@ pub fn parse_external_telemetry_json(
         runway_days,
         antigravity_quotas,
         providers,
+        opencode_go: opencode_go_detail,
+        maxplus: maxplus_detail,
+        tokenme: tokenme_detail,
+        firecrawl: firecrawl_detail,
     })
+}
+
+fn parse_daily_free_credit(val: Option<&serde_json::Value>) -> Option<f64> {
+    let v = val?;
+    if let Some(num) = v.as_f64() {
+        return Some(num);
+    }
+    let obj = v.as_object()?;
+    for field in ["remaining", "credit_usd", "amount", "value", "credit"] {
+        if let Some(num) = obj.get(field).and_then(serde_json::Value::as_f64) {
+            return Some(num);
+        }
+    }
+    None
+}
+
+fn parse_maxplus_detail(mp: &serde_json::Map<String, serde_json::Value>) -> MaxPlusDetail {
+    let credit_usd = mp
+        .get("credit_usd")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0);
+    let daily_free_credit = parse_daily_free_credit(mp.get("daily_free_credit"));
+    let total_used_7keys_usd = mp
+        .get("total_used_7keys_usd")
+        .and_then(serde_json::Value::as_f64);
+
+    let mut periods = Vec::new();
+    if let Some(periods_obj) = mp.get("periods").and_then(serde_json::Value::as_object) {
+        for (json_key, label) in [("24h", "24h"), ("7d", "7d"), ("30d", "30d"), ("all", "All")] {
+            if let Some(p) = periods_obj
+                .get(json_key)
+                .and_then(serde_json::Value::as_object)
+            {
+                let request_count = p
+                    .get("request_count")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let total_tokens = p
+                    .get("total_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0);
+                let total_cost_usd = p
+                    .get("total_cost")
+                    .and_then(serde_json::Value::as_f64)
+                    .unwrap_or(0.0);
+                let per_day_usd = p
+                    .get("per_day_usd")
+                    .and_then(serde_json::Value::as_f64);
+                periods.push(MaxPlusPeriodStat {
+                    label: label.to_owned(),
+                    request_count,
+                    total_tokens,
+                    total_cost_usd,
+                    per_day_usd,
+                });
+            }
+        }
+    }
+
+    // Strictly whitelist safe metadata fields only; NEVER read or retain any raw key/secret field.
+    let mut keys = Vec::new();
+    if let Some(arr) = mp.get("keys").and_then(serde_json::Value::as_array) {
+        for item in arr {
+            let Some(k) = item.as_object() else {
+                continue;
+            };
+            let name = k
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let pool = k
+                .get("pool")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            if name.is_empty() && pool.is_empty() {
+                continue;
+            }
+            let used_usd = k
+                .get("used_usd")
+                .and_then(serde_json::Value::as_f64)
+                .unwrap_or(0.0);
+            let limit_usd = k
+                .get("limit_usd")
+                .and_then(serde_json::Value::as_f64)
+                .filter(|v| *v > 0.0);
+            let limit_period = k
+                .get("limit_period")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let active = k
+                .get("active")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            keys.push(MaxPlusKeyRow {
+                name,
+                pool,
+                used_usd,
+                limit_usd,
+                limit_period,
+                active,
+            });
+        }
+    }
+
+    MaxPlusDetail {
+        credit_usd,
+        daily_free_credit,
+        total_used_7keys_usd,
+        periods,
+        keys,
+    }
+}
+
+fn parse_opencode_go_detail(oc: &serde_json::Map<String, serde_json::Value>) -> OpenCodeGoDetail {
+    let ok = oc
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let read_bucket = |key: &str| -> (f64, String) {
+        let Some(b) = oc.get(key) else {
+            return (0.0, String::new());
+        };
+        let pct = b
+            .get("percent")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0);
+        let reset = b
+            .get("resetsAt")
+            .or_else(|| b.get("reset_at"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_owned();
+        (pct, reset)
+    };
+    let (rolling_used_pct, rolling_reset_at) = read_bucket("rolling");
+    let (weekly_used_pct, weekly_reset_at) = read_bucket("weekly");
+    let (monthly_used_pct, monthly_reset_at) = read_bucket("monthly");
+
+    let combined = oc.get("local_usage").and_then(|l| l.get("combined"));
+    let combined_requests = combined
+        .and_then(|c| c.get("requests"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let combined_tokens = combined
+        .and_then(|c| c.get("total_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+
+    OpenCodeGoDetail {
+        ok,
+        rolling_used_pct,
+        rolling_reset_at,
+        weekly_used_pct,
+        weekly_reset_at,
+        monthly_used_pct,
+        monthly_reset_at,
+        combined_requests,
+        combined_tokens,
+    }
+}
+
+fn parse_tokenme_detail(tm: &serde_json::Map<String, serde_json::Value>) -> TokenMeDetail {
+    let cycle_elapsed_pct = tm
+        .get("cycle_elapsed_pct")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or(0.0)
+        .clamp(0.0, 100.0);
+    let days_left = tm.get("dec17_days").and_then(serde_json::Value::as_u64);
+    let hours_left = tm.get("dec17_hours").and_then(serde_json::Value::as_u64);
+    let cycle = tm.get("combined_cycle");
+    let cycle_requests = cycle
+        .and_then(|c| c.get("requests"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let cycle_tokens = cycle
+        .and_then(|c| c.get("total_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let all_tokens = tm
+        .get("hermes_all")
+        .and_then(|h| h.get("total_tokens"))
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(cycle_tokens);
+    let cycle_end_str = tm
+        .get("cycle_end_str")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+
+    TokenMeDetail {
+        cycle_elapsed_pct,
+        days_left,
+        hours_left,
+        cycle_requests,
+        cycle_tokens,
+        all_tokens,
+        cycle_end_str,
+    }
+}
+
+fn parse_firecrawl_detail(fc: &serde_json::Map<String, serde_json::Value>) -> FirecrawlDetail {
+    let ok = fc
+        .get("ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let remaining_credits = fc
+        .get("remaining_credits")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let plan_credits = fc
+        .get("plan_credits")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    let used_credits = fc
+        .get("used_credits")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or_else(|| plan_credits.saturating_sub(remaining_credits));
+    let remaining_percent = fc
+        .get("remaining_percent")
+        .and_then(serde_json::Value::as_f64)
+        .map_or_else(
+            || {
+                if plan_credits == 0 {
+                    0.0
+                } else {
+                    let rem_u32 = u32::try_from(remaining_credits).unwrap_or(u32::MAX);
+                    let plan_u32 = u32::try_from(plan_credits).unwrap_or(u32::MAX).max(1);
+                    (f64::from(rem_u32) / f64::from(plan_u32) * 100.0).clamp(0.0, 100.0)
+                }
+            },
+            |v| v.clamp(0.0, 100.0),
+        );
+    let billing_period_end = fc
+        .get("billing_period_end")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .trim()
+        .to_owned();
+
+    FirecrawlDetail {
+        ok,
+        remaining_credits,
+        plan_credits,
+        used_credits,
+        remaining_percent,
+        billing_period_end,
+    }
 }
 
 fn parse_server_bucket(raw: Option<&serde_json::Value>) -> Option<ServerQuotaBucket> {
@@ -1639,30 +1864,41 @@ mod tests {
             "meta": {"timestamp_bkk": "2026-11-25 14:00:00 +07"},
             "maxplus": {
                 "credit_usd": 24.50,
-                "keys": [{"id": "k1"}, {"id": "k2"}],
+                "daily_free_credit": {"remaining": 0.50},
+                "total_used_7keys_usd": 14.20,
+                "keys": [
+                    {"name": "router-main", "pool": "primary", "used_usd": 6.40, "limit_usd": 20.0, "limit_period": "monthly", "active": true, "secret_key": "must-never-be-stored"},
+                    {"name": "batch-worker", "pool": "overflow", "used_usd": 1.10, "limit_usd": 10.0, "limit_period": "daily", "active": false}
+                ],
                 "periods": {
-                    "24h": {"total_cost": 1.25},
-                    "7d": {"total_cost": 8.40}
+                    "24h": {"request_count": 38, "total_tokens": 220000, "total_cost": 1.25, "per_day_usd": 1.25},
+                    "7d": {"request_count": 210, "total_tokens": 1450000, "total_cost": 8.40, "per_day_usd": 1.20},
+                    "30d": {"request_count": 760, "total_tokens": 5800000, "total_cost": 29.10, "per_day_usd": 0.97},
+                    "all": {"request_count": 1240, "total_tokens": 9400000, "total_cost": 48.00}
                 }
             },
             "opencode_go": {
                 "ok": true,
-                "rolling": {"percent": 15.0},
-                "weekly": {"percent": 22.0},
-                "monthly": {"percent": 10.0},
-                "local_usage": {"combined": {"requests": 42}}
+                "rolling": {"percent": 15.0, "resetsAt": "2026-11-25T16:30:00Z"},
+                "weekly": {"percent": 22.0, "resetsAt": "2026-12-01T08:00:00Z"},
+                "monthly": {"percent": 10.0, "resetsAt": "2026-12-25T00:00:00Z"},
+                "local_usage": {"combined": {"requests": 42, "total_tokens": 640000}}
             },
             "tokenme": {
                 "cycle_elapsed_pct": 40.0,
                 "dec17_days": 20,
-                "combined_cycle": {"requests": 100, "total_tokens": 500000}
+                "dec17_hours": 6,
+                "cycle_end_str": "Dec 17",
+                "combined_cycle": {"requests": 100, "total_tokens": 500000},
+                "hermes_all": {"api_calls": 480, "total_tokens": 2400000}
             },
             "firecrawl": {
                 "ok": true,
                 "remaining_credits": 450,
                 "plan_credits": 500,
                 "used_credits": 50,
-                "remaining_percent": 90.0
+                "remaining_percent": 90.0,
+                "billing_period_end": "2026-12-15T00:00:00Z"
             },
             "burn_rate": {
                 "snapshot": {"burn_per_day": 2.0, "runway_days": 12.25}
@@ -1690,6 +1926,54 @@ mod tests {
         assert_eq!(parsed.antigravity_quotas.len(), 1);
         assert_eq!(parsed.burn_per_day_usd, Some(2.0));
         assert_eq!(parsed.runway_days, Some(12.25));
+
+        let mp = parsed
+            .maxplus
+            .as_ref()
+            .ok_or_else(|| "expected maxplus detail".to_owned())?;
+        assert!((mp.credit_usd - 24.50).abs() < 0.01);
+        assert_eq!(mp.daily_free_credit, Some(0.50));
+        assert_eq!(mp.total_used_7keys_usd, Some(14.20));
+        let period_labels: Vec<&str> = mp.periods.iter().map(|p| p.label.as_str()).collect();
+        assert_eq!(period_labels, vec!["24h", "7d", "30d", "All"]);
+        assert_eq!(mp.periods[0].request_count, 38);
+        assert_eq!(mp.keys.len(), 2);
+        assert_eq!(mp.keys[0].name, "router-main");
+        assert!(mp.keys[0].active);
+        assert!(!mp.keys[1].active);
+
+        let oc = parsed
+            .opencode_go
+            .as_ref()
+            .ok_or_else(|| "expected opencode_go detail".to_owned())?;
+        assert!(oc.ok);
+        assert!((oc.rolling_used_pct - 15.0).abs() < 0.01);
+        assert_eq!(oc.rolling_reset_at, "2026-11-25T16:30:00Z");
+        assert_eq!(oc.combined_requests, 42);
+        assert_eq!(oc.combined_tokens, 640_000);
+
+        let tm = parsed
+            .tokenme
+            .as_ref()
+            .ok_or_else(|| "expected tokenme detail".to_owned())?;
+        assert!((tm.cycle_elapsed_pct - 40.0).abs() < 0.01);
+        assert_eq!(tm.days_left, Some(20));
+        assert_eq!(tm.hours_left, Some(6));
+        assert_eq!(tm.cycle_requests, 100);
+        assert_eq!(tm.cycle_tokens, 500_000);
+        assert_eq!(tm.all_tokens, 2_400_000);
+        assert_eq!(tm.cycle_end_str, "Dec 17");
+
+        let fc = parsed
+            .firecrawl
+            .as_ref()
+            .ok_or_else(|| "expected firecrawl detail".to_owned())?;
+        assert!(fc.ok);
+        assert_eq!(fc.remaining_credits, 450);
+        assert_eq!(fc.plan_credits, 500);
+        assert_eq!(fc.used_credits, 50);
+        assert!((fc.remaining_percent - 90.0).abs() < 0.01);
+        assert_eq!(fc.billing_period_end, "2026-12-15T00:00:00Z");
 
         let profile = AccountProfile::create_isolated(
             AccountId::new("alpha").map_err(|e| e.to_string())?,

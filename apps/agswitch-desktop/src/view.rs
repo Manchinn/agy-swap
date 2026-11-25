@@ -1,6 +1,8 @@
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -8,15 +10,15 @@ use agswitch_domain::{
     format_clock_hm, format_reset_countdown_from_iso, format_tokens, is_child_process,
 };
 use agswitch_engine::Engine;
-use agswitch_integrations::{
-    default_telemetry_base_url, open_directory_in_file_manager, open_local_url,
-};
+use agswitch_integrations::{default_telemetry_base_url, open_directory_in_file_manager};
 use agswitch_primitives::{AccountTier, AppError, ModelFamily, PhaseId};
 use agswitch_spec::{
     AccountView, AddAccountInput, AuditEntry, AuditOutcome, CallerContext, CommandRequest,
-    CommandResponse, DashboardSnapshot, DeleteAccountInput, SingleModelUsage, UpdateAccountInput,
+    CommandResponse, DashboardSnapshot, DeleteAccountInput, ExternalAntigravityQuota,
+    ExternalTelemetrySnapshot, FirecrawlDetail, MaxPlusDetail, OpenCodeGoDetail, SingleModelUsage,
+    TokenMeDetail, UpdateAccountInput,
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use gpui::{
     AnyElement, Context, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
     KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
@@ -28,7 +30,10 @@ use crate::phosphor::{
     LedMode, LedSpec, PhosphorPool, PhosphorTheme, dot_grid_backdrop, dot_matrix_readout,
     hardware_switch_track, hw_pill, led_housing, segmented_led_bar,
 };
-use crate::{COMPACT_POPOVER_H, COMPACT_POPOVER_W, FULL_POPOVER_H, FULL_POPOVER_W};
+use crate::{
+    COMPACT_POPOVER_H, COMPACT_POPOVER_W, DesktopIntent, FULL_POPOVER_H, FULL_POPOVER_W,
+    PopoverTarget,
+};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ProfileOrbPref {
@@ -106,35 +111,35 @@ enum ConfirmAction {
 }
 
 /// S2 — Samo Instrument palette (`#0C0C0E` obsidian, `#08080A` recessed rail, `#F4F4F5` pearl CTA).
-struct SamoPalette {
-    is_light: bool,
-    shell_bg: Hsla,
-    rail_bg: Hsla,
-    card_bg: Hsla,
-    row_bg: Hsla,
-    row_active: Hsla,
-    row_hover: Hsla,
-    btn_dark: Hsla,
-    border_outer: Hsla,
-    border_hairline: Hsla,
-    border_subtle: Hsla,
-    text_primary: Hsla,
-    text_secondary: Hsla,
-    text_muted: Hsla,
-    digit_lit: Hsla,
-    digit_unlit: Hsla,
-    led_unlit: Hsla,
-    pearl_bg: Hsla,
-    pearl_fg: Hsla,
-    accent_cyan: Hsla,
-    status_ok: Hsla,
-    status_warn: Hsla,
-    status_danger: Hsla,
-    scrim: Hsla,
+pub(crate) struct SamoPalette {
+    pub(crate) is_light: bool,
+    pub(crate) shell_bg: Hsla,
+    pub(crate) rail_bg: Hsla,
+    pub(crate) card_bg: Hsla,
+    pub(crate) row_bg: Hsla,
+    pub(crate) row_active: Hsla,
+    pub(crate) row_hover: Hsla,
+    pub(crate) btn_dark: Hsla,
+    pub(crate) border_outer: Hsla,
+    pub(crate) border_hairline: Hsla,
+    pub(crate) border_subtle: Hsla,
+    pub(crate) text_primary: Hsla,
+    pub(crate) text_secondary: Hsla,
+    pub(crate) text_muted: Hsla,
+    pub(crate) digit_lit: Hsla,
+    pub(crate) digit_unlit: Hsla,
+    pub(crate) led_unlit: Hsla,
+    pub(crate) pearl_bg: Hsla,
+    pub(crate) pearl_fg: Hsla,
+    pub(crate) accent_cyan: Hsla,
+    pub(crate) status_ok: Hsla,
+    pub(crate) status_warn: Hsla,
+    pub(crate) status_danger: Hsla,
+    pub(crate) scrim: Hsla,
 }
 
 impl SamoPalette {
-    fn for_theme(light: bool) -> Self {
+    pub(crate) fn for_theme(light: bool) -> Self {
         if light { Self::light() } else { Self::dark() }
     }
 
@@ -203,6 +208,8 @@ pub struct AgSwitchView {
     shared_snap: Arc<Mutex<Option<DashboardSnapshot>>>,
     ui_prefs_path: PathBuf,
     is_sandbox: bool,
+    intent_tx: Sender<DesktopIntent>,
+    hud_open: Arc<AtomicBool>,
     on_close_notify: Option<Box<dyn Fn() + 'static>>,
     phosphor: PhosphorPool,
     focus_handle: FocusHandle,
@@ -218,6 +225,7 @@ pub struct AgSwitchView {
     hide_emails: bool,
     light_theme: bool,
     compact_mode: bool,
+    maxplus_keys_expanded: bool,
     profile_orbs: BTreeMap<String, ResolvedOrb>,
     showcase_mode: LedMode,
     showcase_label: &'static str,
@@ -241,6 +249,9 @@ impl AgSwitchView {
         ui_prefs_path: PathBuf,
         is_sandbox: bool,
         demo_page: Option<String>,
+        initial_target: Option<PopoverTarget>,
+        intent_tx: Sender<DesktopIntent>,
+        hud_open: Arc<AtomicBool>,
         on_close: impl Fn() + 'static,
     ) -> Self {
         let focus_handle = cx.focus_handle();
@@ -346,12 +357,21 @@ impl AgSwitchView {
             }
         }
 
+        if let Some(target) = initial_target {
+            initial_page = match target {
+                PopoverTarget::SplitOverview => PopoverPage::SplitOverview,
+                PopoverTarget::Providers => PopoverPage::Providers,
+            };
+        }
+
         let view = Self {
             engine,
             rt,
             shared_snap,
             ui_prefs_path,
             is_sandbox,
+            intent_tx,
+            hud_open,
             on_close_notify: Some(Box::new(on_close)),
             phosphor: PhosphorPool::new(),
             focus_handle,
@@ -367,6 +387,7 @@ impl AgSwitchView {
             hide_emails: prefs.hide_emails,
             light_theme,
             compact_mode,
+            maxplus_keys_expanded: false,
             profile_orbs,
             showcase_mode,
             showcase_label,
@@ -482,6 +503,21 @@ impl AgSwitchView {
             (FULL_POPOVER_W, FULL_POPOVER_H)
         };
         window.resize(size(px(w), px(h)));
+    }
+
+    pub fn navigate_to_target(
+        &mut self,
+        target: PopoverTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let page = match target {
+            PopoverTarget::SplitOverview => PopoverPage::SplitOverview,
+            PopoverTarget::Providers => PopoverPage::Providers,
+        };
+        self.form_state = None;
+        self.confirm_action = None;
+        self.navigate_to(page, window, cx);
     }
 
     fn navigate_to(&mut self, page: PopoverPage, window: &mut Window, cx: &mut Context<Self>) {
@@ -4713,40 +4749,39 @@ impl AgSwitchView {
     ) -> AnyElement {
         let ext = snap.external_telemetry.as_ref().filter(|t| t.connected);
         let base_url = default_telemetry_base_url();
-        let console_url = format!("{base_url}/opendesign/mockups/ai-usage-tracker/index.html");
-        let mini_hud_url =
-            format!("{base_url}/opendesign/mockups/ai-usage-tracker/widget.html?mode=mini");
+        let now_utc = Utc::now();
+        let hud_active = self.hud_open.load(Ordering::Relaxed);
 
-        let (status_badge, status_col, status_bg, sub_meta) = if let Some(t) = ext {
-            let mut parts = vec![format!("Source: {}", t.source_label)];
-            if !t.updated_at.is_empty() {
-                parts.push(t.updated_at.clone());
-            }
-            if let Some(burn) = t.burn_per_day_usd {
-                parts.push(format!("Burn ${burn:.2}/d"));
-            }
-            if let Some(rw) = t.runway_days {
-                parts.push(format!("{rw:.1}d runway"));
-            }
-            (
-                "BRIDGE LIVE",
-                p.status_ok,
-                rgba(0x34D3_9922),
-                parts.join(" · "),
-            )
+        let maxplus_credit_str = ext
+            .and_then(|t| t.maxplus.as_ref())
+            .map_or_else(|| "–".to_owned(), |m| format!("${:.2}", m.credit_usd));
+        let burn_str = ext
+            .and_then(|t| t.burn_per_day_usd)
+            .map_or_else(|| "–".to_owned(), |b| format!("${b:.2}/d"));
+        let (runway_str, runway_col) = match ext.and_then(|t| t.runway_days) {
+            Some(rw) if rw < 3.0 => (format!("{rw:.1}d"), p.status_danger),
+            Some(rw) if rw < 7.0 => (format!("{rw:.1}d"), p.status_warn),
+            Some(rw) => (format!("{rw:.1}d"), p.status_ok),
+            None => ("–".to_owned(), p.text_muted),
+        };
+        let (bridge_badge, bridge_col, bridge_bg, bridge_meta) = if let Some(t) = ext {
+            let meta = if t.updated_at.is_empty() {
+                t.source_label.clone()
+            } else {
+                format!("{} · {}", t.source_label, t.updated_at)
+            };
+            ("LIVE", p.status_ok, rgba(0x34D3_9922), meta)
         } else {
             (
-                "BRIDGE OFFLINE",
+                "OFFLINE",
                 p.status_warn,
                 rgba(0xFBBF_2422),
-                format!(
-                    "Start local tracker on {base_url} or set AGSWITCH_TELEMETRY_FILE"
-                ),
+                format!("Feeder: {base_url}"),
             )
         };
 
-        let top_bar = div()
-            .p(px(12.0))
+        let kpi_bar = div()
+            .p(px(11.0))
             .rounded(px(12.0))
             .bg(p.card_bg)
             .border_1()
@@ -4760,38 +4795,57 @@ impl AgSwitchView {
                     .flex_1()
                     .min_w_0()
                     .flex()
-                    .flex_col()
-                    .gap(px(3.0))
+                    .items_center()
+                    .gap(px(14.0))
+                    .child(render_kpi_cell(
+                        "MAXPLUS",
+                        maxplus_credit_str,
+                        p.text_primary,
+                        p,
+                    ))
+                    .child(render_kpi_divider(p))
+                    .child(render_kpi_cell("BURN / DAY", burn_str, p.text_primary, p))
+                    .child(render_kpi_divider(p))
+                    .child(render_kpi_cell("RUNWAY", runway_str, runway_col, p))
+                    .child(render_kpi_divider(p))
                     .child(
                         div()
+                            .flex_1()
+                            .min_w_0()
                             .flex()
-                            .items_center()
-                            .gap(px(6.0))
+                            .flex_col()
+                            .gap(px(2.0))
                             .child(
                                 div()
-                                    .px(px(6.0))
-                                    .py(px(1.5))
-                                    .rounded(px(4.0))
-                                    .bg(status_bg)
-                                    .text_size(px(8.5))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(status_col)
-                                    .child(status_badge),
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        div()
+                                            .text_size(px(8.5))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(p.text_muted)
+                                            .child("BRIDGE"),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(5.0))
+                                            .py(px(1.0))
+                                            .rounded(px(4.0))
+                                            .bg(bridge_bg)
+                                            .text_size(px(8.0))
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(bridge_col)
+                                            .child(bridge_badge),
+                                    ),
                             )
                             .child(
                                 div()
-                                    .text_size(px(11.0))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(p.text_primary)
-                                    .child("Multi-Provider Telemetry"),
+                                    .whitespace_nowrap()
+                                    .text_size(px(9.0))
+                                    .text_color(p.text_muted)
+                                    .child(clip_text(&bridge_meta, 24)),
                             ),
-                    )
-                    .child(
-                        div()
-                            .whitespace_nowrap()
-                            .text_size(px(9.5))
-                            .text_color(p.text_muted)
-                            .child(clip_text(&sub_meta, 56)),
                     ),
             )
             .child(
@@ -4800,6 +4854,46 @@ impl AgSwitchView {
                     .flex()
                     .items_center()
                     .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("prov-hud-toggle-btn")
+                            .h(px(28.0))
+                            .px(px(9.5))
+                            .rounded(px(7.0))
+                            .bg(if hud_active {
+                                rgba(0x6FD8_EE22).into()
+                            } else {
+                                p.pearl_bg
+                            })
+                            .border_1()
+                            .border_color(if hud_active {
+                                p.accent_cyan
+                            } else {
+                                p.pearl_bg
+                            })
+                            .text_size(px(10.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(if hud_active {
+                                p.accent_cyan
+                            } else {
+                                p.pearl_fg
+                            })
+                            .flex()
+                            .items_center()
+                            .gap(px(4.0))
+                            .cursor_pointer()
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                let _ = v.intent_tx.send(DesktopIntent::ToggleMiniHud);
+                                let next = !v.hud_open.load(Ordering::Relaxed);
+                                v.toast_line = Some(if next {
+                                    "Opening Native Mini HUD…".to_owned()
+                                } else {
+                                    "Closing Native Mini HUD…".to_owned()
+                                });
+                                cx.notify();
+                            }))
+                            .child(if hud_active { "● Mini HUD" } else { "Mini HUD" }),
+                    )
                     .child(
                         div()
                             .id("prov-refresh-btn")
@@ -4824,52 +4918,6 @@ impl AgSwitchView {
                                 );
                             }))
                             .child("↻ Fresh"),
-                    )
-                    .child(
-                        div()
-                            .id("prov-console-btn")
-                            .h(px(28.0))
-                            .px(px(9.0))
-                            .rounded(px(7.0))
-                            .bg(p.btn_dark)
-                            .border_1()
-                            .border_color(p.border_hairline)
-                            .text_size(px(10.0))
-                            .text_color(p.accent_cyan)
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .hover(|s| s.border_color(p.accent_cyan))
-                            .on_click(cx.listener(move |v, _, _, cx| {
-                                v.toast_line = Some(match open_local_url(&console_url) {
-                                    Ok(()) => "Opened Full Console ↗".to_owned(),
-                                    Err(e) => e.to_string(),
-                                });
-                                cx.notify();
-                            }))
-                            .child("Console ↗"),
-                    )
-                    .child(
-                        div()
-                            .id("prov-hud-btn")
-                            .h(px(28.0))
-                            .px(px(9.0))
-                            .rounded(px(7.0))
-                            .bg(p.pearl_bg)
-                            .text_size(px(10.0))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(p.pearl_fg)
-                            .flex()
-                            .items_center()
-                            .cursor_pointer()
-                            .on_click(cx.listener(move |v, _, _, cx| {
-                                v.toast_line = Some(match open_local_url(&mini_hud_url) {
-                                    Ok(()) => "Opened Mini HUD Strip ↗".to_owned(),
-                                    Err(e) => e.to_string(),
-                                });
-                                cx.notify();
-                            }))
-                            .child("Mini HUD ↗"),
                     ),
             );
 
@@ -4881,190 +4929,43 @@ impl AgSwitchView {
             .p(px(14.0))
             .flex()
             .flex_col()
-            .gap(px(12.0))
-            .child(top_bar);
+            .gap(px(10.0))
+            .child(kpi_bar);
 
         if let Some(t) = ext {
-            // 2-Column Provider Grid
-            if !t.providers.is_empty() {
-                let mut rows_col = div().flex().flex_col().gap(px(8.0));
-                for pair in t.providers.chunks(2) {
-                    let mut row = div().flex().flex_row().gap(px(8.0));
-                    for prov in pair {
-                        let (badge_col, badge_bg, led_theme) = match prov.status_badge.as_str() {
-                            "LOW" => (p.status_danger, rgba(0xFF5A_4722), PhosphorTheme::Red),
-                            "WARN" => (p.status_warn, rgba(0xFBBF_2422), PhosphorTheme::Amber),
-                            "OFF" => (p.text_muted, rgba(0xFFFF_FF10), PhosphorTheme::White),
-                            _ => (p.status_ok, rgba(0x34D3_9922), PhosphorTheme::Emerald),
-                        };
-                        let mut card = div()
-                            .flex_1()
-                            .min_w_0()
-                            .p(px(11.0))
-                            .rounded(px(11.0))
-                            .bg(p.card_bg)
-                            .border_1()
-                            .border_color(p.border_hairline)
-                            .flex()
-                            .flex_col()
-                            .gap(px(6.0))
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .child(
-                                        div()
-                                            .text_size(px(11.5))
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(p.text_primary)
-                                            .child(prov.name.clone()),
-                                    )
-                                    .child(
-                                        div()
-                                            .px(px(5.5))
-                                            .py(px(1.5))
-                                            .rounded(px(4.0))
-                                            .bg(badge_bg)
-                                            .text_size(px(8.0))
-                                            .font_weight(gpui::FontWeight::BOLD)
-                                            .text_color(badge_col)
-                                            .child(prov.status_badge.clone()),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(13.0))
-                                    .font_weight(gpui::FontWeight::BOLD)
-                                    .text_color(p.text_primary)
-                                    .child(clip_text(&prov.headline, 28)),
-                            );
-
-                        if let Some(pct) = prov.remaining_percent {
-                            card = card.child(segmented_led_bar(
-                                16,
-                                percent_to_f32_fraction(pct),
-                                led_theme,
-                                p.led_unlit,
-                                11.0,
-                                4.5,
-                                2.5,
-                            ));
-                        }
-
-                        card = card.child(
-                            div()
-                                .whitespace_nowrap()
-                                .text_size(px(9.5))
-                                .text_color(p.text_muted)
-                                .child(clip_text(&prov.subline, 38)),
-                        );
-
-                        row = row.child(card);
-                    }
-                    if pair.len() == 1 {
-                        row = row.child(div().flex_1());
-                    }
-                    rows_col = rows_col.child(row);
-                }
-                content = content.child(rows_col);
+            // 1. OpenCode Go Card (3 separate LED bars: 5-HOUR, WEEKLY, MONTHLY)
+            if let Some(oc) = t.opencode_go.as_ref() {
+                content = content.child(render_opencode_go_card(oc, now_utc, p));
             }
 
-            // Tracked Antigravity Server Quotas
-            if !t.antigravity_quotas.is_empty() {
-                let mut ag_card = div()
-                    .p(px(12.0))
-                    .rounded(px(12.0))
-                    .bg(p.card_bg)
-                    .border_1()
-                    .border_color(p.border_hairline)
-                    .flex()
-                    .flex_col()
-                    .gap(px(8.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_size(px(9.5))
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .text_color(p.text_muted)
-                                    .child("ANTIGRAVITY SERVER QUOTAS (5H / WEEKLY)"),
-                            )
-                            .child(
-                                div()
-                                    .text_size(px(9.5))
-                                    .text_color(p.text_muted)
-                                    .child(format!("{} accounts", t.antigravity_quotas.len())),
-                            ),
-                    );
-
-                for q in &t.antigravity_quotas {
-                    let display_id = if !q.email.is_empty() {
-                        format_email_display(&q.email, false, self.hide_emails)
-                    } else {
-                        q.name.clone()
-                    };
-                    let g5 = q
-                        .gemini_5h
-                        .as_ref()
-                        .map_or_else(|| "–".to_owned(), |b| format!("{:.0}%", b.remaining_percent));
-                    let gw = q
-                        .gemini_weekly
-                        .as_ref()
-                        .map_or_else(|| "–".to_owned(), |b| format!("{:.0}%", b.remaining_percent));
-                    let cg5 = q
-                        .claude_gpt_5h
-                        .as_ref()
-                        .map_or_else(|| "–".to_owned(), |b| format!("{:.0}%", b.remaining_percent));
-                    let cgw = q
-                        .claude_gpt_weekly
-                        .as_ref()
-                        .map_or_else(|| "–".to_owned(), |b| format!("{:.0}%", b.remaining_percent));
-
-                    ag_card = ag_card.child(
-                        div()
-                            .px(px(10.0))
-                            .py(px(7.0))
-                            .rounded(px(8.0))
-                            .bg(p.row_bg)
-                            .border_1()
-                            .border_color(p.border_subtle)
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .gap(px(8.0))
-                            .child(
-                                div()
-                                    .text_size(px(10.5))
-                                    .font_weight(gpui::FontWeight::MEDIUM)
-                                    .text_color(p.text_primary)
-                                    .child(clip_text(&display_id, 28)),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(10.0))
-                                    .text_size(px(10.0))
-                                    .child(
-                                        div()
-                                            .text_color(p.accent_cyan)
-                                            .child(format!("G {g5} / {gw}w")),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_color(p.status_ok)
-                                            .child(format!("C&G {cg5} / {cgw}w")),
-                                    ),
-                            ),
-                    );
-                }
-
-                content = content.child(ag_card);
+            // 2. MaxPlus Card (Credit headline + 4-period strip + collapsible 7-Keys table)
+            if let Some(mp) = t.maxplus.as_ref() {
+                content = content.child(self.render_maxplus_card(mp, p, cx));
             }
+
+            // 3. TokenMe + Firecrawl 2-Column Row
+            if t.tokenme.is_some() || t.firecrawl.is_some() {
+                let mut pair_row = div().flex().flex_row().gap(px(10.0));
+                if let Some(tm) = t.tokenme.as_ref() {
+                    pair_row = pair_row.child(render_tokenme_card(tm, p));
+                }
+                if let Some(fc) = t.firecrawl.as_ref() {
+                    pair_row = pair_row.child(render_firecrawl_card(fc, now_utc, p));
+                }
+                if t.tokenme.is_none() || t.firecrawl.is_none() {
+                    pair_row = pair_row.child(div().flex_1());
+                }
+                content = content.child(pair_row);
+            }
+
+            // 4. Antigravity Server Quotas Card (strict-matched + countdowns, respecting hide_emails)
+            content = content.child(render_antigravity_server_quotas_card(
+                snap,
+                t,
+                self.hide_emails,
+                now_utc,
+                p,
+            ));
         } else {
             content = content.child(
                 div()
@@ -5081,20 +4982,313 @@ impl AgSwitchView {
                             .text_size(px(12.0))
                             .font_weight(gpui::FontWeight::SEMIBOLD)
                             .text_color(p.text_primary)
-                            .child("Local Telemetry Bridge not connected"),
+                            .child("Local Telemetry Bridge Offline"),
                     )
                     .child(
                         div()
                             .text_size(px(10.5))
                             .text_color(p.text_secondary)
-                            .child(
-                                "AGY Swap works standalone with local 5h timers (Zero OAuth). To overlay live multi-provider credits and exact server quotas, start your local AI Usage Tracker server on localhost:8289 or click ↻ Fresh.",
-                            ),
+                            .child(format!(
+                                "AGY Swap works standalone with local 5h timers (Zero OAuth). Start the headless feeder on {base_url} or set AGSWITCH_TELEMETRY_FILE, then click ↻ Fresh."
+                            )),
                     ),
             );
         }
 
         content.into_any_element()
+    }
+
+    fn render_maxplus_card(
+        &self,
+        mp: &MaxPlusDetail,
+        p: &SamoPalette,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement + use<> {
+        let (badge_txt, badge_col, badge_bg) = if mp.credit_usd < 3.0 {
+            ("LOW", p.status_danger, rgba(0xFF5A_4722))
+        } else if mp.credit_usd < 10.0 {
+            ("WARN", p.status_warn, rgba(0xFBBF_2422))
+        } else {
+            ("LIVE", p.status_ok, rgba(0x34D3_9922))
+        };
+
+        let mut header_left = div()
+            .flex()
+            .items_center()
+            .gap(px(7.0))
+            .child(
+                div()
+                    .w(px(6.0))
+                    .h(px(6.0))
+                    .rounded(px(999.0))
+                    .bg(PhosphorTheme::Amber.accent()),
+            )
+            .child(
+                div()
+                    .text_size(px(11.0))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(p.text_primary)
+                    .child("MAXPLUS"),
+            )
+            .child(
+                div()
+                    .text_size(px(13.0))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .text_color(p.text_primary)
+                    .child(format!("${:.2}", mp.credit_usd)),
+            );
+
+        if let Some(free) = mp.daily_free_credit
+            && free > 0.0
+        {
+            header_left = header_left.child(
+                div()
+                    .px(px(5.5))
+                    .py(px(1.5))
+                    .rounded(px(4.0))
+                    .bg(rgba(0x34D3_991A))
+                    .text_size(px(8.5))
+                    .text_color(p.status_ok)
+                    .child(format!("+${free:.2} free")),
+            );
+        }
+
+        let mut card = div()
+            .p(px(11.0))
+            .rounded(px(12.0))
+            .bg(p.card_bg)
+            .border_1()
+            .border_color(p.border_hairline)
+            .flex()
+            .flex_col()
+            .gap(px(8.0))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .child(header_left)
+                    .child(
+                        div()
+                            .px(px(5.5))
+                            .py(px(1.5))
+                            .rounded(px(4.0))
+                            .bg(badge_bg)
+                            .text_size(px(8.0))
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(badge_col)
+                            .child(badge_txt),
+                    ),
+            );
+
+        // Compact 4-period spend strip (24h, 7d, 30d, All)
+        if !mp.periods.is_empty() {
+            let mut strip = div().flex().flex_row().gap(px(6.0));
+            for stat in &mp.periods {
+                let sub = if let Some(per_day) = stat.per_day_usd {
+                    format!("{}r · ${per_day:.2}/d", stat.request_count)
+                } else {
+                    format!(
+                        "{}r · {}",
+                        stat.request_count,
+                        format_tokens(stat.total_tokens)
+                    )
+                };
+                strip = strip.child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .px(px(8.0))
+                        .py(px(6.0))
+                        .rounded(px(8.0))
+                        .bg(p.row_bg)
+                        .border_1()
+                        .border_color(p.border_subtle)
+                        .flex()
+                        .flex_col()
+                        .gap(px(2.0))
+                        .child(
+                            div()
+                                .text_size(px(8.5))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.text_muted)
+                                .child(stat.label.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.5))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(p.text_primary)
+                                .child(format!("${:.2}", stat.total_cost_usd)),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(px(8.5))
+                                .text_color(p.text_muted)
+                                .child(clip_text(&sub, 18)),
+                        ),
+                );
+            }
+            card = card.child(strip);
+        }
+
+        // Collapsible 7-Keys table (collapsed by default)
+        if !mp.keys.is_empty() {
+            let expanded = self.maxplus_keys_expanded;
+            let key_count = mp.keys.len();
+            let toggle_label = if expanded {
+                format!("Keys ({key_count}) ▴")
+            } else {
+                format!("Keys ({key_count}) ▾")
+            };
+            let used_caption = mp
+                .total_used_7keys_usd
+                .map(|u| format!("Total used ${u:.2}"))
+                .unwrap_or_default();
+
+            card = card.child(
+                div()
+                    .id("mp-keys-toggle")
+                    .px(px(8.0))
+                    .py(px(5.0))
+                    .rounded(px(7.0))
+                    .bg(p.btn_dark)
+                    .border_1()
+                    .border_color(p.border_subtle)
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .cursor_pointer()
+                    .hover(|s| s.border_color(p.border_outer))
+                    .on_click(cx.listener(|v, _, _, cx| {
+                        v.maxplus_keys_expanded = !v.maxplus_keys_expanded;
+                        cx.notify();
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(9.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.text_primary)
+                            .child(toggle_label),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(9.0))
+                            .text_color(p.text_muted)
+                            .child(used_caption),
+                    ),
+            );
+
+            if expanded {
+                let mut table = div()
+                    .rounded(px(8.0))
+                    .bg(p.rail_bg)
+                    .border_1()
+                    .border_color(p.border_subtle)
+                    .p(px(6.0))
+                    .flex()
+                    .flex_col()
+                    .gap(px(4.0))
+                    .child(
+                        div()
+                            .px(px(6.0))
+                            .pb(px(3.0))
+                            .border_b_1()
+                            .border_color(p.border_subtle)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .text_size(px(8.5))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.text_muted)
+                            .child("KEY")
+                            .child("POOL / USED / LIMIT"),
+                    );
+
+                for row in &mp.keys {
+                    let dot_col = if row.active {
+                        p.status_ok
+                    } else {
+                        p.text_muted
+                    };
+                    let usage_str = match row.limit_usd {
+                        Some(lim) if !row.limit_period.is_empty() => {
+                            format!("${:.2} / ${lim:.0} {}", row.used_usd, row.limit_period)
+                        }
+                        Some(lim) => format!("${:.2} / ${lim:.0}", row.used_usd),
+                        None => format!("${:.2}", row.used_usd),
+                    };
+                    table = table.child(
+                        div()
+                            .px(px(6.0))
+                            .py(px(3.5))
+                            .rounded(px(5.0))
+                            .bg(p.row_bg)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .w(px(5.5))
+                                            .h(px(5.5))
+                                            .rounded(px(999.0))
+                                            .bg(dot_col),
+                                    )
+                                    .child(
+                                        div()
+                                            .whitespace_nowrap()
+                                            .text_size(px(9.5))
+                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                            .text_color(if row.active {
+                                                p.text_primary
+                                            } else {
+                                                p.text_muted
+                                            })
+                                            .child(clip_text(&row.name, 22)),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(6.0))
+                                    .child(
+                                        div()
+                                            .px(px(5.0))
+                                            .py(px(1.0))
+                                            .rounded(px(4.0))
+                                            .bg(p.btn_dark)
+                                            .text_size(px(8.5))
+                                            .text_color(p.text_secondary)
+                                            .child(if row.pool.is_empty() {
+                                                "default".to_owned()
+                                            } else {
+                                                clip_text(&row.pool, 10)
+                                            }),
+                                    )
+                                    .child(
+                                        div()
+                                            .whitespace_nowrap()
+                                            .text_size(px(9.5))
+                                            .text_color(p.text_primary)
+                                            .child(usage_str),
+                                    ),
+                            ),
+                    );
+                }
+
+                card = card.child(table);
+            }
+        }
+
+        card
     }
 }
 
@@ -5222,7 +5416,7 @@ fn render_timer_pool_row(
 
 /// Converts remaining seconds in a 5-hour (18,000s) local window into a `0.0..=1.0` LED bar fill fraction.
 /// `None` means no active 5h rolling window (full 5:00 ready -> `1.0`).
-fn window_5h_fraction(secs: Option<u64>) -> f32 {
+pub(crate) fn window_5h_fraction(secs: Option<u64>) -> f32 {
     let Some(remaining) = secs else {
         return 1.0;
     };
@@ -5232,19 +5426,730 @@ fn window_5h_fraction(secs: Option<u64>) -> f32 {
 }
 
 /// Converts a `0.0..=100.0` remaining percentage into a `0.0..=1.0` LED bar fill fraction without `as` casts.
-fn percent_to_f32_fraction(pct: f64) -> f32 {
+pub(crate) fn percent_to_f32_fraction(pct: f64) -> f32 {
     let clamped = pct.clamp(0.0, 100.0);
     let parsed: f32 = format!("{clamped:.1}").parse().unwrap_or(0.0);
     (parsed / 100.0).clamp(0.0, 1.0)
 }
 
-fn server_pct_theme(pct: f64, base: PhosphorTheme) -> PhosphorTheme {
+pub(crate) fn server_pct_theme(pct: f64, base: PhosphorTheme) -> PhosphorTheme {
     if pct <= 5.0 {
         PhosphorTheme::Red
     } else if pct <= 25.0 {
         PhosphorTheme::Amber
     } else {
         base
+    }
+}
+
+fn render_kpi_cell(
+    label: &'static str,
+    value: String,
+    value_col: Hsla,
+    p: &SamoPalette,
+) -> impl IntoElement + use<> {
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            div()
+                .text_size(px(8.5))
+                .font_weight(gpui::FontWeight::SEMIBOLD)
+                .text_color(p.text_muted)
+                .child(label),
+        )
+        .child(
+            div()
+                .whitespace_nowrap()
+                .text_size(px(13.0))
+                .font_weight(gpui::FontWeight::BOLD)
+                .text_color(value_col)
+                .child(value),
+        )
+}
+
+fn render_kpi_divider(p: &SamoPalette) -> impl IntoElement + use<> {
+    div().w(px(1.0)).h(px(24.0)).bg(p.border_subtle)
+}
+
+fn render_opencode_go_card(
+    oc: &OpenCodeGoDetail,
+    now_utc: DateTime<Utc>,
+    p: &SamoPalette,
+) -> impl IntoElement + use<> {
+    let rem_5h = (100.0 - oc.rolling_used_pct).clamp(0.0, 100.0);
+    let rem_wk = (100.0 - oc.weekly_used_pct).clamp(0.0, 100.0);
+    let rem_mo = (100.0 - oc.monthly_used_pct).clamp(0.0, 100.0);
+    let worst = rem_5h.min(rem_wk).min(rem_mo);
+
+    let (badge_txt, badge_col, badge_bg) = if worst <= 5.0 {
+        ("LOW", p.status_danger, rgba(0xFF5A_4722))
+    } else if worst <= 25.0 {
+        ("WARN", p.status_warn, rgba(0xFBBF_2422))
+    } else {
+        ("LIVE", p.status_ok, rgba(0x34D3_9922))
+    };
+
+    let stats_line = format!(
+        "{} reqs · {} tok",
+        oc.combined_requests,
+        format_tokens(oc.combined_tokens)
+    );
+
+    div()
+        .p(px(11.0))
+        .rounded(px(12.0))
+        .bg(p.card_bg)
+        .border_1()
+        .border_color(p.border_hairline)
+        .flex()
+        .flex_col()
+        .gap(px(7.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(7.0))
+                        .child(
+                            div()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .rounded(px(999.0))
+                                .bg(PhosphorTheme::Cyan.accent()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(11.0))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(p.text_primary)
+                                .child("OPENCODE GO"),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(9.5))
+                                .text_color(p.text_muted)
+                                .child(stats_line),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(5.5))
+                        .py(px(1.5))
+                        .rounded(px(4.0))
+                        .bg(badge_bg)
+                        .text_size(px(8.0))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(badge_col)
+                        .child(badge_txt),
+                ),
+        )
+        .child(render_opencode_window_row(
+            "5-HOUR",
+            oc.rolling_used_pct,
+            rem_5h,
+            &oc.rolling_reset_at,
+            now_utc,
+            p,
+        ))
+        .child(render_opencode_window_row(
+            "WEEKLY",
+            oc.weekly_used_pct,
+            rem_wk,
+            &oc.weekly_reset_at,
+            now_utc,
+            p,
+        ))
+        .child(render_opencode_window_row(
+            "MONTHLY",
+            oc.monthly_used_pct,
+            rem_mo,
+            &oc.monthly_reset_at,
+            now_utc,
+            p,
+        ))
+}
+
+fn render_opencode_window_row(
+    label: &'static str,
+    used_pct: f64,
+    rem_pct: f64,
+    reset_at: &str,
+    now_utc: DateTime<Utc>,
+    p: &SamoPalette,
+) -> impl IntoElement + use<> {
+    let reset_txt = format_reset_countdown_from_iso(reset_at, now_utc)
+        .map(|r| format!("Resets in {r}"))
+        .unwrap_or_default();
+    let bar = segmented_led_bar(
+        24,
+        percent_to_f32_fraction(rem_pct),
+        server_pct_theme(rem_pct, PhosphorTheme::Cyan),
+        p.led_unlit,
+        10.0,
+        4.5,
+        2.0,
+    );
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(p.text_muted)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(8.0))
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(px(9.0))
+                                .text_color(p.text_muted)
+                                .child(reset_txt),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(px(9.5))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(p.text_primary)
+                                .child(format!("{used_pct:.0}% used · {rem_pct:.0}% left")),
+                        ),
+                ),
+        )
+        .child(bar)
+}
+
+fn render_tokenme_card(tm: &TokenMeDetail, p: &SamoPalette) -> impl IntoElement + use<> {
+    let time_left = match (tm.days_left, tm.hours_left) {
+        (Some(d), Some(h)) => format!("{d}d {h}h left"),
+        (Some(d), None) => format!("{d}d left"),
+        (None, Some(h)) => format!("{h}h left"),
+        (None, None) => String::new(),
+    };
+    let bar = segmented_led_bar(
+        16,
+        percent_to_f32_fraction(tm.cycle_elapsed_pct),
+        PhosphorTheme::Cyan,
+        p.led_unlit,
+        10.0,
+        4.5,
+        2.0,
+    );
+    let cycle_sub = format!(
+        "Cycle: {} reqs · {}",
+        tm.cycle_requests,
+        format_tokens(tm.cycle_tokens)
+    );
+    let all_sub = format!(
+        "All: {} · Ends {}",
+        format_tokens(tm.all_tokens),
+        if tm.cycle_end_str.is_empty() {
+            "–"
+        } else {
+            tm.cycle_end_str.as_str()
+        }
+    );
+
+    div()
+        .flex_1()
+        .min_w_0()
+        .p(px(11.0))
+        .rounded(px(12.0))
+        .bg(p.card_bg)
+        .border_1()
+        .border_color(p.border_hairline)
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .rounded(px(999.0))
+                                .bg(PhosphorTheme::Cyan.accent()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(p.text_primary)
+                                .child("TOKENME"),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(5.5))
+                        .py(px(1.5))
+                        .rounded(px(4.0))
+                        .bg(rgba(0x34D3_9922))
+                        .text_size(px(8.0))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(p.status_ok)
+                        .child("LIVE"),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .justify_between()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(p.text_primary)
+                        .child(format!("Cycle {:.0}%", tm.cycle_elapsed_pct)),
+                )
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_size(px(9.5))
+                        .text_color(p.accent_cyan)
+                        .child(time_left),
+                ),
+        )
+        .child(bar)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_size(px(9.0))
+                        .text_color(p.text_secondary)
+                        .child(clip_text(&cycle_sub, 34)),
+                )
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_size(px(9.0))
+                        .text_color(p.text_muted)
+                        .child(clip_text(&all_sub, 34)),
+                ),
+        )
+}
+
+fn render_firecrawl_card(
+    fc: &FirecrawlDetail,
+    now_utc: DateTime<Utc>,
+    p: &SamoPalette,
+) -> impl IntoElement + use<> {
+    let (badge_txt, badge_col, badge_bg) = if fc.remaining_percent <= 10.0 {
+        ("LOW", p.status_danger, rgba(0xFF5A_4722))
+    } else if fc.remaining_percent <= 30.0 {
+        ("WARN", p.status_warn, rgba(0xFBBF_2422))
+    } else {
+        ("LIVE", p.status_ok, rgba(0x34D3_9922))
+    };
+    let bar = segmented_led_bar(
+        16,
+        percent_to_f32_fraction(fc.remaining_percent),
+        server_pct_theme(fc.remaining_percent, PhosphorTheme::Emerald),
+        p.led_unlit,
+        10.0,
+        4.5,
+        2.0,
+    );
+    let reset_date = format_iso_date_short(&fc.billing_period_end);
+    let reset_cd = format_reset_countdown_from_iso(&fc.billing_period_end, now_utc);
+    let reset_line = match (reset_date.is_empty(), reset_cd) {
+        (false, Some(cd)) => format!("Resets {reset_date} ({cd})"),
+        (false, None) => format!("Resets {reset_date}"),
+        (true, Some(cd)) => format!("Resets in {cd}"),
+        (true, None) => "Billing period active".to_owned(),
+    };
+
+    div()
+        .flex_1()
+        .min_w_0()
+        .p(px(11.0))
+        .rounded(px(12.0))
+        .bg(p.card_bg)
+        .border_1()
+        .border_color(p.border_hairline)
+        .flex()
+        .flex_col()
+        .gap(px(6.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .rounded(px(999.0))
+                                .bg(PhosphorTheme::Emerald.accent()),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(p.text_primary)
+                                .child("FIRECRAWL"),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(5.5))
+                        .py(px(1.5))
+                        .rounded(px(4.0))
+                        .bg(badge_bg)
+                        .text_size(px(8.0))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(badge_col)
+                        .child(badge_txt),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_baseline()
+                .justify_between()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(12.5))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(p.text_primary)
+                        .child(format!("{} / {}", fc.remaining_credits, fc.plan_credits)),
+                )
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_size(px(9.5))
+                        .text_color(p.text_secondary)
+                        .child(format!(
+                            "{:.0}% used",
+                            (100.0 - fc.remaining_percent).clamp(0.0, 100.0)
+                        )),
+                ),
+        )
+        .child(bar)
+        .child(
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_size(px(9.0))
+                        .text_color(p.text_secondary)
+                        .child(format!("{} credits used", fc.used_credits)),
+                )
+                .child(
+                    div()
+                        .whitespace_nowrap()
+                        .text_size(px(9.0))
+                        .text_color(p.text_muted)
+                        .child(clip_text(&reset_line, 34)),
+                ),
+        )
+}
+
+fn render_antigravity_server_quotas_card(
+    snap: &DashboardSnapshot,
+    t: &ExternalTelemetrySnapshot,
+    hide_emails: bool,
+    now_utc: DateTime<Utc>,
+    p: &SamoPalette,
+) -> impl IntoElement + use<> {
+    let matched_accounts: Vec<(&AccountView, &ExternalAntigravityQuota)> = snap
+        .accounts
+        .iter()
+        .filter_map(|acc| acc.server_quota.as_ref().filter(|q| q.ok).map(|q| (acc, q)))
+        .collect();
+
+    let matched_emails: Vec<String> = matched_accounts
+        .iter()
+        .map(|(_, q)| q.email.trim().to_ascii_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect();
+
+    let unmatched_quotas: Vec<&ExternalAntigravityQuota> = t
+        .antigravity_quotas
+        .iter()
+        .filter(|q| {
+            q.ok && {
+                let norm = q.email.trim().to_ascii_lowercase();
+                norm.is_empty() || !matched_emails.iter().any(|m| m == &norm)
+            }
+        })
+        .collect();
+
+    let total_shown = matched_accounts.len() + unmatched_quotas.len();
+
+    let mut card = div()
+        .p(px(11.0))
+        .rounded(px(12.0))
+        .bg(p.card_bg)
+        .border_1()
+        .border_color(p.border_hairline)
+        .flex()
+        .flex_col()
+        .gap(px(7.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .w(px(6.0))
+                                .h(px(6.0))
+                                .rounded(px(999.0))
+                                .bg(p.status_ok),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(10.0))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(p.text_primary)
+                                .child("ANTIGRAVITY SERVER QUOTAS"),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .text_color(p.text_muted)
+                        .child(format!(
+                            "{} matched · {} total",
+                            matched_accounts.len(),
+                            total_shown
+                        )),
+                ),
+        );
+
+    if total_shown == 0 {
+        card = card.child(
+            div()
+                .text_size(px(9.5))
+                .text_color(p.text_muted)
+                .child("No Antigravity server quotas reported by local feeder."),
+        );
+        return card;
+    }
+
+    for (acc, q) in matched_accounts {
+        let email_disp = if !q.email.is_empty() {
+            format_email_display(&q.email, acc.is_default_profile, hide_emails)
+        } else {
+            format_email_display(&acc.subtitle, acc.is_default_profile, hide_emails)
+        };
+        let tag = if acc.is_running { "ACTIVE" } else { "MATCHED" };
+        let tag_col = if acc.is_running {
+            p.status_ok
+        } else {
+            p.accent_cyan
+        };
+        let tag_bg = if acc.is_running {
+            rgba(0x34D3_9922)
+        } else {
+            rgba(0x6FD8_EE1E)
+        };
+        card = card.child(render_antigravity_quota_row(
+            &acc.display_name,
+            &email_disp,
+            tag,
+            tag_col,
+            tag_bg,
+            q,
+            now_utc,
+            p,
+        ));
+    }
+
+    for q in unmatched_quotas {
+        let email_disp = if !q.email.is_empty() {
+            format_email_display(&q.email, false, hide_emails)
+        } else {
+            q.name.clone()
+        };
+        let title = if q.name.is_empty() {
+            "Feeder Account"
+        } else {
+            q.name.as_str()
+        };
+        card = card.child(render_antigravity_quota_row(
+            title,
+            &email_disp,
+            "FEEDER",
+            p.text_muted,
+            rgba(0xFFFF_FF10),
+            q,
+            now_utc,
+            p,
+        ));
+    }
+
+    card
+}
+
+#[allow(clippy::too_many_arguments)]
+fn render_antigravity_quota_row(
+    title: &str,
+    subtitle: &str,
+    tag: &'static str,
+    tag_col: Hsla,
+    tag_bg: gpui::Rgba,
+    q: &ExternalAntigravityQuota,
+    now_utc: DateTime<Utc>,
+    p: &SamoPalette,
+) -> impl IntoElement + use<> {
+    let g5_pct = q.gemini_5h.as_ref().map(|b| b.remaining_percent);
+    let gw_pct = q.gemini_weekly.as_ref().map(|b| b.remaining_percent);
+    let g5_cd = q
+        .gemini_5h
+        .as_ref()
+        .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+    let gw_cd = q
+        .gemini_weekly
+        .as_ref()
+        .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+
+    let cg5_pct = q.claude_gpt_5h.as_ref().map(|b| b.remaining_percent);
+    let cgw_pct = q.claude_gpt_weekly.as_ref().map(|b| b.remaining_percent);
+    let cg5_cd = q
+        .claude_gpt_5h
+        .as_ref()
+        .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+    let cgw_cd = q
+        .claude_gpt_weekly
+        .as_ref()
+        .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+
+    let g_line = format_dual_quota_compact("Gemini", g5_pct, g5_cd, gw_pct, gw_cd);
+    let cg_line = format_dual_quota_compact("Claude/GPT", cg5_pct, cg5_cd, cgw_pct, cgw_cd);
+
+    div()
+        .px(px(9.0))
+        .py(px(7.0))
+        .rounded(px(8.0))
+        .bg(p.row_bg)
+        .border_1()
+        .border_color(p.border_subtle)
+        .flex()
+        .flex_col()
+        .gap(px(4.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .text_size(px(10.5))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .text_color(p.text_primary)
+                                .child(clip_text(title, 20)),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(9.0))
+                                .text_color(p.text_muted)
+                                .child(clip_text(subtitle, 28)),
+                        ),
+                )
+                .child(
+                    div()
+                        .px(px(5.0))
+                        .py(px(1.0))
+                        .rounded(px(4.0))
+                        .bg(tag_bg)
+                        .text_size(px(8.0))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(tag_col)
+                        .child(tag),
+                ),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(8.0))
+                .text_size(px(9.0))
+                .child(div().text_color(p.accent_cyan).child(g_line))
+                .child(div().text_color(p.status_ok).child(cg_line)),
+        )
+}
+
+fn format_dual_quota_compact(
+    pool: &str,
+    pct_5h: Option<f64>,
+    cd_5h: Option<String>,
+    pct_wk: Option<f64>,
+    cd_wk: Option<String>,
+) -> String {
+    let s5 = match (pct_5h, cd_5h) {
+        (Some(p), Some(cd)) => format!("5h {p:.0}% ({cd})"),
+        (Some(p), None) => format!("5h {p:.0}%"),
+        (None, _) => "5h –".to_owned(),
+    };
+    let sw = match (pct_wk, cd_wk) {
+        (Some(p), Some(cd)) => format!("Wk {p:.0}% ({cd})"),
+        (Some(p), None) => format!("Wk {p:.0}%"),
+        (None, _) => "Wk –".to_owned(),
+    };
+    format!("{pool}: {s5} · {sw}")
+}
+
+fn format_iso_date_short(iso: &str) -> String {
+    let trimmed = iso.trim();
+    if trimmed.len() >= 10 {
+        trimmed.chars().take(10).collect()
+    } else {
+        trimmed.to_owned()
     }
 }
 
@@ -5313,7 +6218,7 @@ fn render_server_quota_bar_row(
         .child(bar)
 }
 
-fn timer_bar_theme(
+pub(crate) fn timer_bar_theme(
     secs: Option<u64>,
     is_cooldown: bool,
     active_theme: PhosphorTheme,
@@ -5337,7 +6242,7 @@ fn timer_unit_label(secs: Option<u64>, is_cooldown: bool) -> &'static str {
     }
 }
 
-fn clip_text(raw: &str, max_chars: usize) -> String {
+pub(crate) fn clip_text(raw: &str, max_chars: usize) -> String {
     let count = raw.chars().count();
     if count <= max_chars {
         return raw.to_owned();

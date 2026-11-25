@@ -1522,6 +1522,7 @@ mod engine_tests {
                 claude_gpt_weekly: None,
             }],
             providers: Vec::new(),
+            ..ExternalTelemetrySnapshot::default()
         };
         let engine = base_engine.with_telemetry(Arc::new(FakeTelemetry(ext)));
 

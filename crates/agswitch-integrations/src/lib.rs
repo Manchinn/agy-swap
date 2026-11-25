@@ -1110,8 +1110,9 @@ pub mod sandbox {
     use agswitch_engine::domain;
     use agswitch_engine::spec::{
         AccountProfile, ExternalAntigravityQuota, ExternalProviderSummary,
-        ExternalTelemetrySnapshot, LaunchSpec, RunningInstance, ServerQuotaBucket, SwitcherConfig,
-        TranscriptFeed, TranscriptStep, UsageLedger,
+        ExternalTelemetrySnapshot, FirecrawlDetail, LaunchSpec, MaxPlusDetail, MaxPlusKeyRow,
+        MaxPlusPeriodStat, OpenCodeGoDetail, RunningInstance, ServerQuotaBucket, SwitcherConfig,
+        TokenMeDetail, TranscriptFeed, TranscriptStep, UsageLedger,
     };
     use agswitch_engine::{BoxFut, ProcessPort, TelemetryFeedPort, TranscriptPort};
     use agswitch_primitives::{AccountId, AccountTier, AppError, RuntimeOs};
@@ -1484,6 +1485,10 @@ pub mod sandbox {
             let g_wk_reset = (now + Duration::hours(138)).to_rfc3339();
             let cg_reset = (now + Duration::minutes(118)).to_rfc3339();
             let cg_wk_reset = (now + Duration::hours(164)).to_rfc3339();
+            let oc_5h_reset = (now + Duration::minutes(195)).to_rfc3339();
+            let oc_wk_reset = (now + Duration::hours(112)).to_rfc3339();
+            let oc_mo_reset = (now + Duration::days(19)).to_rfc3339();
+            let fc_reset = (now + Duration::days(21)).to_rfc3339();
             Some(ExternalTelemetrySnapshot {
                 connected: true,
                 source_label: "sandbox-bridge".to_owned(),
@@ -1580,6 +1585,111 @@ pub mod sandbox {
                         status_badge: "LIVE".to_owned(),
                     },
                 ],
+                opencode_go: Some(OpenCodeGoDetail {
+                    ok: true,
+                    rolling_used_pct: 18.0,
+                    rolling_reset_at: oc_5h_reset,
+                    weekly_used_pct: 24.0,
+                    weekly_reset_at: oc_wk_reset,
+                    monthly_used_pct: 12.0,
+                    monthly_reset_at: oc_mo_reset,
+                    combined_requests: 148,
+                    combined_tokens: 1_940_000,
+                }),
+                maxplus: Some(MaxPlusDetail {
+                    credit_usd: 29.90,
+                    daily_free_credit: Some(0.50),
+                    total_used_7keys_usd: Some(20.10),
+                    periods: vec![
+                        MaxPlusPeriodStat {
+                            label: "24h".to_owned(),
+                            request_count: 64,
+                            total_tokens: 410_000,
+                            total_cost_usd: 1.40,
+                            per_day_usd: Some(1.40),
+                        },
+                        MaxPlusPeriodStat {
+                            label: "7d".to_owned(),
+                            request_count: 412,
+                            total_tokens: 2_890_000,
+                            total_cost_usd: 9.80,
+                            per_day_usd: Some(1.40),
+                        },
+                        MaxPlusPeriodStat {
+                            label: "30d".to_owned(),
+                            request_count: 1_520,
+                            total_tokens: 11_400_000,
+                            total_cost_usd: 36.20,
+                            per_day_usd: Some(1.21),
+                        },
+                        MaxPlusPeriodStat {
+                            label: "All".to_owned(),
+                            request_count: 2_840,
+                            total_tokens: 21_600_000,
+                            total_cost_usd: 64.50,
+                            per_day_usd: None,
+                        },
+                    ],
+                    keys: vec![
+                        MaxPlusKeyRow {
+                            name: "primary-cli".to_owned(),
+                            pool: "main".to_owned(),
+                            used_usd: 8.40,
+                            limit_usd: Some(25.0),
+                            limit_period: "monthly".to_owned(),
+                            active: true,
+                        },
+                        MaxPlusKeyRow {
+                            name: "router-agent".to_owned(),
+                            pool: "main".to_owned(),
+                            used_usd: 6.10,
+                            limit_usd: Some(20.0),
+                            limit_period: "monthly".to_owned(),
+                            active: true,
+                        },
+                        MaxPlusKeyRow {
+                            name: "code-review".to_owned(),
+                            pool: "aux".to_owned(),
+                            used_usd: 3.20,
+                            limit_usd: Some(10.0),
+                            limit_period: "weekly".to_owned(),
+                            active: true,
+                        },
+                        MaxPlusKeyRow {
+                            name: "batch-eval".to_owned(),
+                            pool: "aux".to_owned(),
+                            used_usd: 1.55,
+                            limit_usd: Some(10.0),
+                            limit_period: "monthly".to_owned(),
+                            active: false,
+                        },
+                        MaxPlusKeyRow {
+                            name: "sandbox-ci".to_owned(),
+                            pool: "dev".to_owned(),
+                            used_usd: 0.85,
+                            limit_usd: Some(5.0),
+                            limit_period: "daily".to_owned(),
+                            active: true,
+                        },
+                    ],
+                }),
+                tokenme: Some(TokenMeDetail {
+                    cycle_elapsed_pct: 38.0,
+                    days_left: Some(19),
+                    hours_left: Some(7),
+                    cycle_requests: 312,
+                    cycle_tokens: 4_200_000,
+                    all_tokens: 18_700_000,
+                    cycle_end_str: "Dec 17".to_owned(),
+                }),
+                firecrawl: Some(FirecrawlDetail {
+                    ok: true,
+                    remaining_credits: 420,
+                    plan_credits: 500,
+                    used_credits: 80,
+                    remaining_percent: 84.0,
+                    billing_period_end: fc_reset,
+                }),
             })
         }
     }

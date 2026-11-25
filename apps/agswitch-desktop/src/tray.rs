@@ -5,7 +5,7 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, Rect, TrayIcon, TrayIconBui
 pub const MENU_TOGGLE_PANEL: &str = "agswitch.toggle_panel";
 pub const MENU_SWITCH_NEXT: &str = "agswitch.switch_next";
 pub const MENU_OPEN_CONSOLE: &str = "agswitch.open_console";
-pub const MENU_OPEN_MINI_HUD: &str = "agswitch.open_mini_hud";
+pub const MENU_TOGGLE_MINI_HUD: &str = "agswitch.toggle_mini_hud";
 pub const MENU_OPEN_FOLDER: &str = "agswitch.open_folder";
 pub const MENU_QUIT: &str = "agswitch.quit";
 pub const MENU_ACCOUNT_PREFIX: &str = "agswitch.acc.";
@@ -36,7 +36,7 @@ pub enum TrayAction {
     SwitchNext,
     SwitchAccount(String),
     OpenUsageConsole,
-    OpenMiniHud,
+    ToggleMiniHud,
     OpenProfilesFolder,
     Quit,
 }
@@ -147,8 +147,8 @@ impl TrayController {
                 actions.push(TrayAction::SwitchNext);
             } else if id == MENU_OPEN_CONSOLE {
                 actions.push(TrayAction::OpenUsageConsole);
-            } else if id == MENU_OPEN_MINI_HUD {
-                actions.push(TrayAction::OpenMiniHud);
+            } else if id == MENU_TOGGLE_MINI_HUD {
+                actions.push(TrayAction::ToggleMiniHud);
             } else if id == MENU_OPEN_FOLDER {
                 actions.push(TrayAction::OpenProfilesFolder);
             } else if id == MENU_QUIT {
@@ -211,13 +211,13 @@ fn build_menu(snap: Option<&DashboardSnapshot>) -> Menu {
     );
     let item_console = MenuItem::with_id(
         MenuId::new(MENU_OPEN_CONSOLE),
-        "Open Usage Console ↗",
+        "Open Telemetry Console",
         true,
         None,
     );
     let item_mini_hud = MenuItem::with_id(
-        MenuId::new(MENU_OPEN_MINI_HUD),
-        "Open Mini HUD Strip ↗",
+        MenuId::new(MENU_TOGGLE_MINI_HUD),
+        "Toggle Mini HUD Strip",
         true,
         None,
     );

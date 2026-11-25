@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod hud;
 mod phosphor;
 mod tray;
 mod view;
@@ -8,6 +9,8 @@ use std::cell::RefCell;
 use std::path::PathBuf;
 use std::process::ExitCode;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -15,8 +18,7 @@ use agswitch_engine::{Engine, EngineDefaults, ProcessPort, TelemetryFeedPort, Tr
 use agswitch_integrations::{
     LocalTelemetryBridgeAdapter, OsProcessAdapter, OsTranscriptAdapter, OsWorkspaceLinkAdapter,
     SystemClockAdapter, default_antigravity_bin_path, default_data_dir, default_profiles_root_dir,
-    default_telemetry_base_url, open_directory_in_file_manager, open_local_url, primary_home_dir,
-    sandbox,
+    open_directory_in_file_manager, primary_home_dir, sandbox,
 };
 use agswitch_primitives::RuntimeOs;
 use agswitch_spec::{CallerContext, CommandRequest, CommandResponse, DashboardSnapshot};
@@ -26,6 +28,7 @@ use gpui::{
     WindowKind, WindowOptions, point, px, size,
 };
 
+use crate::hud::MiniHudView;
 use crate::tray::{TrayAction, TrayAnchorRect, TrayController};
 use crate::view::AgSwitchView;
 
@@ -33,10 +36,28 @@ pub const FULL_POPOVER_W: f32 = 680.0;
 pub const FULL_POPOVER_H: f32 = 524.0;
 pub const COMPACT_POPOVER_W: f32 = 320.0;
 pub const COMPACT_POPOVER_H: f32 = 420.0;
+pub const MINI_HUD_W: f32 = 780.0;
+pub const MINI_HUD_H: f32 = 76.0;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PopoverTarget {
+    SplitOverview,
+    Providers,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesktopIntent {
+    ToggleMiniHud,
+    OpenPopoverPage(PopoverTarget),
+}
 
 struct PopoverSlot {
     handle: Option<WindowHandle<AgSwitchView>>,
     last_toggle: Instant,
+}
+
+struct HudSlot {
+    handle: Option<WindowHandle<MiniHudView>>,
 }
 
 fn main() -> ExitCode {
@@ -56,6 +77,7 @@ fn main() -> ExitCode {
     let is_sandbox = args.iter().any(|a| a == "--sandbox" || a == "--demo")
         || std::env::var("AGSWITCH_SANDBOX")
             .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"));
+    let open_hud_on_start = args.iter().any(|a| a == "--hud");
     let demo_page = if is_sandbox {
         args.windows(2)
             .find(|w| w.first().is_some_and(|a| a == "--demo-page"))
@@ -118,6 +140,8 @@ fn main() -> ExitCode {
 
     let ui_prefs_path = data_dir.join("ui-prefs.json");
     let shared_snap: Arc<Mutex<Option<DashboardSnapshot>>> = Arc::new(Mutex::new(None));
+    let hud_open = Arc::new(AtomicBool::new(false));
+    let (intent_tx, intent_rx) = mpsc::channel::<DesktopIntent>();
 
     Application::new().run(move |cx: &mut App| {
         // Initialize top Menu Bar (macOS) / System Tray (Windows) icon on main UI thread
@@ -130,29 +154,51 @@ fn main() -> ExitCode {
                 .checked_sub(Duration::from_secs(1))
                 .unwrap_or_else(Instant::now),
         }));
+        let hud_slot = Rc::new(RefCell::new(HudSlot { handle: None }));
 
-        // Open initial Samo-style menu-bar popover directly underneath the tray icon
-        let initial_anchor = tray.borrow().as_ref().and_then(TrayController::anchor_rect);
-        open_popover(
-            cx,
-            initial_anchor,
-            &popover_slot,
-            engine.clone(),
-            rt.clone(),
-            shared_snap.clone(),
-            ui_prefs_path.clone(),
-            is_sandbox,
-            demo_page.clone(),
-        );
+        if open_hud_on_start {
+            open_mini_hud(
+                cx,
+                &hud_slot,
+                engine.clone(),
+                rt.clone(),
+                shared_snap.clone(),
+                ui_prefs_path.clone(),
+                intent_tx.clone(),
+                hud_open.clone(),
+            );
+        }
 
-        // App-level tray & background menu sync loop (stays alive even while popover is closed)
+        // Open initial Samo-style menu-bar popover unless launched directly in --hud-only mode
+        if !open_hud_on_start || demo_page.is_some() {
+            let initial_anchor = tray.borrow().as_ref().and_then(TrayController::anchor_rect);
+            open_popover(
+                cx,
+                initial_anchor,
+                &popover_slot,
+                engine.clone(),
+                rt.clone(),
+                shared_snap.clone(),
+                ui_prefs_path.clone(),
+                is_sandbox,
+                demo_page.clone(),
+                None,
+                intent_tx.clone(),
+                hud_open.clone(),
+            );
+        }
+
+        // App-level tray, cross-window intent, & background menu sync loop
         let tray_loop = tray.clone();
         let slot_loop = popover_slot.clone();
+        let hud_slot_loop = hud_slot.clone();
         let engine_loop = engine.clone();
         let rt_loop = rt.clone();
         let snap_loop = shared_snap.clone();
         let profiles_dir_loop = profiles_root.clone();
         let prefs_loop = ui_prefs_path.clone();
+        let intent_tx_loop = intent_tx.clone();
+        let hud_open_loop = hud_open.clone();
 
         cx.spawn(async move |cx| {
             let mut ticks: u32 = 0;
@@ -189,6 +235,47 @@ fn main() -> ExitCode {
                     }
                 }
 
+                // Drain cross-window UI intents (Mini HUD toggle, HUD cell -> Popover navigation)
+                while let Ok(intent) = intent_rx.try_recv() {
+                    match intent {
+                        DesktopIntent::ToggleMiniHud => {
+                            let _ = cx.update(|cx| {
+                                toggle_mini_hud(
+                                    cx,
+                                    &hud_slot_loop,
+                                    engine_loop.clone(),
+                                    rt_loop.clone(),
+                                    snap_loop.clone(),
+                                    prefs_loop.clone(),
+                                    intent_tx_loop.clone(),
+                                    hud_open_loop.clone(),
+                                );
+                            });
+                        }
+                        DesktopIntent::OpenPopoverPage(target) => {
+                            let _ = cx.update(|cx| {
+                                let anchor = tray_loop
+                                    .borrow()
+                                    .as_ref()
+                                    .and_then(TrayController::anchor_rect);
+                                open_or_focus_popover(
+                                    cx,
+                                    anchor,
+                                    &slot_loop,
+                                    engine_loop.clone(),
+                                    rt_loop.clone(),
+                                    snap_loop.clone(),
+                                    prefs_loop.clone(),
+                                    is_sandbox,
+                                    target,
+                                    intent_tx_loop.clone(),
+                                    hud_open_loop.clone(),
+                                );
+                            });
+                        }
+                    }
+                }
+
                 let actions: Vec<TrayAction> = cx
                     .update(|_cx| {
                         tray_loop
@@ -211,6 +298,8 @@ fn main() -> ExitCode {
                                     snap_loop.clone(),
                                     prefs_loop.clone(),
                                     is_sandbox,
+                                    intent_tx_loop.clone(),
+                                    hud_open_loop.clone(),
                                 );
                             });
                         }
@@ -241,16 +330,39 @@ fn main() -> ExitCode {
                                 .await;
                         }
                         TrayAction::OpenUsageConsole => {
-                            let base = default_telemetry_base_url();
-                            let url = format!("{base}/opendesign/mockups/ai-usage-tracker/index.html");
-                            let _ = open_local_url(&url);
+                            let _ = cx.update(|cx| {
+                                let anchor = tray_loop
+                                    .borrow()
+                                    .as_ref()
+                                    .and_then(TrayController::anchor_rect);
+                                open_or_focus_popover(
+                                    cx,
+                                    anchor,
+                                    &slot_loop,
+                                    engine_loop.clone(),
+                                    rt_loop.clone(),
+                                    snap_loop.clone(),
+                                    prefs_loop.clone(),
+                                    is_sandbox,
+                                    PopoverTarget::Providers,
+                                    intent_tx_loop.clone(),
+                                    hud_open_loop.clone(),
+                                );
+                            });
                         }
-                        TrayAction::OpenMiniHud => {
-                            let base = default_telemetry_base_url();
-                            let url = format!(
-                                "{base}/opendesign/mockups/ai-usage-tracker/widget.html?mode=mini"
-                            );
-                            let _ = open_local_url(&url);
+                        TrayAction::ToggleMiniHud => {
+                            let _ = cx.update(|cx| {
+                                toggle_mini_hud(
+                                    cx,
+                                    &hud_slot_loop,
+                                    engine_loop.clone(),
+                                    rt_loop.clone(),
+                                    snap_loop.clone(),
+                                    prefs_loop.clone(),
+                                    intent_tx_loop.clone(),
+                                    hud_open_loop.clone(),
+                                );
+                            });
                         }
                         TrayAction::OpenProfilesFolder => {
                             let _ =
@@ -280,6 +392,8 @@ fn toggle_popover(
     shared_snap: Arc<Mutex<Option<DashboardSnapshot>>>,
     ui_prefs_path: PathBuf,
     is_sandbox: bool,
+    intent_tx: Sender<DesktopIntent>,
+    hud_open: Arc<AtomicBool>,
 ) {
     let existing = slot.borrow().handle;
     if let Some(handle) = existing {
@@ -306,6 +420,54 @@ fn toggle_popover(
         ui_prefs_path,
         is_sandbox,
         None,
+        None,
+        intent_tx,
+        hud_open,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_or_focus_popover(
+    cx: &mut App,
+    anchor: Option<TrayAnchorRect>,
+    slot: &Rc<RefCell<PopoverSlot>>,
+    engine: Arc<Engine>,
+    rt: Arc<tokio::runtime::Runtime>,
+    shared_snap: Arc<Mutex<Option<DashboardSnapshot>>>,
+    ui_prefs_path: PathBuf,
+    is_sandbox: bool,
+    target: PopoverTarget,
+    intent_tx: Sender<DesktopIntent>,
+    hud_open: Arc<AtomicBool>,
+) {
+    let existing = slot.borrow().handle;
+    if let Some(handle) = existing {
+        let updated = handle
+            .update(cx, |view, window, cx| {
+                view.navigate_to_target(target, window, cx);
+                window.activate_window();
+            })
+            .is_ok();
+        if updated {
+            cx.activate(true);
+            return;
+        }
+        slot.borrow_mut().handle = None;
+    }
+
+    open_popover(
+        cx,
+        anchor,
+        slot,
+        engine,
+        rt,
+        shared_snap,
+        ui_prefs_path,
+        is_sandbox,
+        None,
+        Some(target),
+        intent_tx,
+        hud_open,
     );
 }
 
@@ -320,11 +482,15 @@ fn open_popover(
     ui_prefs_path: PathBuf,
     is_sandbox: bool,
     demo_page: Option<String>,
+    initial_target: Option<PopoverTarget>,
+    intent_tx: Sender<DesktopIntent>,
+    hud_open: Arc<AtomicBool>,
 ) {
-    let is_compact = match demo_page.as_deref() {
-        Some("compact" | "compact-light") => true,
-        Some(_) => false,
-        None => read_initial_compact_pref(&ui_prefs_path),
+    let is_compact = match (demo_page.as_deref(), initial_target) {
+        (_, Some(PopoverTarget::Providers)) => false,
+        (Some("compact" | "compact-light"), _) => true,
+        (Some(_), _) => false,
+        (None, _) => read_initial_compact_pref(&ui_prefs_path),
     };
     let bounds = compute_popover_bounds(cx, anchor, is_compact);
     let options = WindowOptions {
@@ -353,6 +519,9 @@ fn open_popover(
                 ui_prefs_path,
                 is_sandbox,
                 demo_page,
+                initial_target,
+                intent_tx,
+                hud_open,
                 move || {
                     slot_for_close.borrow_mut().handle = None;
                 },
@@ -368,6 +537,143 @@ fn open_popover(
             eprintln!("failed to open GPUI popover: {err}");
         }
     }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn toggle_mini_hud(
+    cx: &mut App,
+    slot: &Rc<RefCell<HudSlot>>,
+    engine: Arc<Engine>,
+    rt: Arc<tokio::runtime::Runtime>,
+    shared_snap: Arc<Mutex<Option<DashboardSnapshot>>>,
+    ui_prefs_path: PathBuf,
+    intent_tx: Sender<DesktopIntent>,
+    hud_open: Arc<AtomicBool>,
+) {
+    let existing = slot.borrow().handle;
+    if let Some(handle) = existing {
+        let was_open = cx
+            .update_window(handle.into(), |_view, window, _cx| {
+                window.remove_window();
+            })
+            .is_ok();
+        slot.borrow_mut().handle = None;
+        hud_open.store(false, Ordering::Relaxed);
+        if was_open {
+            return;
+        }
+    }
+
+    open_mini_hud(
+        cx,
+        slot,
+        engine,
+        rt,
+        shared_snap,
+        ui_prefs_path,
+        intent_tx,
+        hud_open,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn open_mini_hud(
+    cx: &mut App,
+    slot: &Rc<RefCell<HudSlot>>,
+    engine: Arc<Engine>,
+    rt: Arc<tokio::runtime::Runtime>,
+    shared_snap: Arc<Mutex<Option<DashboardSnapshot>>>,
+    ui_prefs_path: PathBuf,
+    intent_tx: Sender<DesktopIntent>,
+    hud_open: Arc<AtomicBool>,
+) {
+    let bounds = compute_hud_bounds(cx);
+    let options = WindowOptions {
+        window_bounds: Some(WindowBounds::Windowed(bounds)),
+        // Frameless transparent floating strip: movable via native drag grip (WindowControlArea::Drag)
+        titlebar: None,
+        window_background: WindowBackgroundAppearance::Transparent,
+        kind: WindowKind::PopUp,
+        focus: true,
+        show: true,
+        is_movable: true,
+        is_resizable: false,
+        is_minimizable: false,
+        ..WindowOptions::default()
+    };
+
+    let slot_for_close = slot.clone();
+    let hud_open_for_close = hud_open.clone();
+    match cx.open_window(options, move |window, cx| {
+        cx.new(|cx| {
+            MiniHudView::new(
+                window,
+                cx,
+                engine,
+                rt,
+                shared_snap,
+                ui_prefs_path,
+                intent_tx,
+                move || {
+                    slot_for_close.borrow_mut().handle = None;
+                    hud_open_for_close.store(false, Ordering::Relaxed);
+                },
+            )
+        })
+    }) {
+        Ok(handle) => {
+            slot.borrow_mut().handle = Some(handle);
+            hud_open.store(true, Ordering::Relaxed);
+        }
+        Err(err) => {
+            eprintln!("failed to open GPUI Mini HUD Strip: {err}");
+        }
+    }
+}
+
+fn compute_hud_bounds(cx: &App) -> Bounds<gpui::Pixels> {
+    let (disp_x, disp_y, disp_w, disp_h) = if let Some(display) = cx.primary_display() {
+        let b = display.bounds();
+        let x: f32 = b.origin.x.into();
+        let y: f32 = b.origin.y.into();
+        let w: f32 = b.size.width.into();
+        let h: f32 = b.size.height.into();
+        (x, y, w, h)
+    } else {
+        (0.0, 0.0, 1440.0, 900.0)
+    };
+
+    let (origin_x, origin_y) = hud_origin(
+        (disp_x, disp_y, disp_w, disp_h),
+        (MINI_HUD_W, MINI_HUD_H),
+        cfg!(target_os = "windows"),
+    );
+
+    Bounds::new(
+        point(px(origin_x), px(origin_y)),
+        size(px(MINI_HUD_W), px(MINI_HUD_H)),
+    )
+}
+
+/// Default origin for the floating 5-Cell Mini HUD Strip:
+/// - Windows: bottom-center just above the taskbar.
+/// - macOS / other: top-center just below the menu bar.
+fn hud_origin(disp: (f32, f32, f32, f32), hud: (f32, f32), is_windows: bool) -> (f32, f32) {
+    let (disp_x, disp_y, disp_w, disp_h) = disp;
+    let (hud_w, hud_h) = hud;
+
+    let raw_x = disp_x + (disp_w - hud_w) * 0.5;
+    let raw_y = if is_windows {
+        disp_y + disp_h - hud_h - 56.0
+    } else {
+        disp_y + 38.0
+    };
+
+    let min_x = disp_x + 10.0;
+    let max_x = (disp_x + disp_w - hud_w - 10.0).max(min_x);
+    let min_y = disp_y + 8.0;
+    let max_y = (disp_y + disp_h - hud_h - 8.0).max(min_y);
+    (raw_x.clamp(min_x, max_x), raw_y.clamp(min_y, max_y))
 }
 
 /// GPUI 0.2.2's Windows backend posts `WM_QUIT` as soon as its LAST window is destroyed
@@ -685,5 +991,27 @@ mod tests {
         };
         let got = estimate_windows_tray_scale(icon, display_at(1.0));
         assert!((got - 1.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn hud_origin_centers_above_taskbar_on_windows_and_top_on_macos() {
+        for scale in [1.0_f32, 1.25, 1.5, 1.75, 2.0] {
+            let disp = display_at(scale);
+            let (_, _, disp_w, disp_h) = disp;
+            let (wx, wy) = hud_origin(disp, (MINI_HUD_W, MINI_HUD_H), true);
+            assert!(wx >= 10.0 && wx + MINI_HUD_W <= disp_w, "scale {scale}: wx={wx}");
+            assert!(
+                wy >= 8.0 && wy + MINI_HUD_H <= disp_h - 8.0,
+                "scale {scale}: wy={wy}"
+            );
+            // Must stay above the ~48px Windows taskbar when display height allows
+            if disp_h >= MINI_HUD_H + 64.0 {
+                assert!(wy + MINI_HUD_H <= disp_h - 48.0, "scale {scale}: wy={wy}");
+            }
+        }
+
+        let (mx, my) = hud_origin((0.0, 0.0, 1512.0, 982.0), (MINI_HUD_W, MINI_HUD_H), false);
+        assert!((my - 38.0).abs() < f32::EPSILON);
+        assert!((mx - (1512.0 - MINI_HUD_W) * 0.5).abs() < 0.5);
     }
 }

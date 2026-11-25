@@ -363,6 +363,106 @@ pub struct ExternalProviderSummary {
     pub status_badge: String,
 }
 
+/// Detailed OpenCode Go rolling/weekly/monthly usage limits and local counters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct OpenCodeGoDetail {
+    pub ok: bool,
+    #[serde(default)]
+    pub rolling_used_pct: f64,
+    #[serde(default)]
+    pub rolling_reset_at: String,
+    #[serde(default)]
+    pub weekly_used_pct: f64,
+    #[serde(default)]
+    pub weekly_reset_at: String,
+    #[serde(default)]
+    pub monthly_used_pct: f64,
+    #[serde(default)]
+    pub monthly_reset_at: String,
+    #[serde(default)]
+    pub combined_requests: u64,
+    #[serde(default)]
+    pub combined_tokens: u64,
+}
+
+/// One MaxPlus spend window (`24h`, `7d`, `30d`, `All`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MaxPlusPeriodStat {
+    pub label: String,
+    #[serde(default)]
+    pub request_count: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+    #[serde(default)]
+    pub total_cost_usd: f64,
+    #[serde(default)]
+    pub per_day_usd: Option<f64>,
+}
+
+/// Safe metadata row for a single MaxPlus API key (never holds raw secrets or tokens).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MaxPlusKeyRow {
+    pub name: String,
+    #[serde(default)]
+    pub pool: String,
+    #[serde(default)]
+    pub used_usd: f64,
+    #[serde(default)]
+    pub limit_usd: Option<f64>,
+    #[serde(default)]
+    pub limit_period: String,
+    #[serde(default)]
+    pub active: bool,
+}
+
+/// Detailed MaxPlus balance, multi-period spend, and safe key summary rows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct MaxPlusDetail {
+    pub credit_usd: f64,
+    #[serde(default)]
+    pub daily_free_credit: Option<f64>,
+    #[serde(default)]
+    pub total_used_7keys_usd: Option<f64>,
+    #[serde(default)]
+    pub periods: Vec<MaxPlusPeriodStat>,
+    #[serde(default)]
+    pub keys: Vec<MaxPlusKeyRow>,
+}
+
+/// Detailed TokenMe billing cycle telemetry and token counters.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct TokenMeDetail {
+    pub cycle_elapsed_pct: f64,
+    #[serde(default)]
+    pub days_left: Option<u64>,
+    #[serde(default)]
+    pub hours_left: Option<u64>,
+    #[serde(default)]
+    pub cycle_requests: u64,
+    #[serde(default)]
+    pub cycle_tokens: u64,
+    #[serde(default)]
+    pub all_tokens: u64,
+    #[serde(default)]
+    pub cycle_end_str: String,
+}
+
+/// Detailed Firecrawl credit balance and billing period end date.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct FirecrawlDetail {
+    pub ok: bool,
+    #[serde(default)]
+    pub remaining_credits: u64,
+    #[serde(default)]
+    pub plan_credits: u64,
+    #[serde(default)]
+    pub used_credits: u64,
+    #[serde(default)]
+    pub remaining_percent: f64,
+    #[serde(default)]
+    pub billing_period_end: String,
+}
+
 /// Optional snapshot from a local telemetry bridge (`http://127.0.0.1:8289/api/usage.json` or JSON file).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct ExternalTelemetrySnapshot {
@@ -379,6 +479,14 @@ pub struct ExternalTelemetrySnapshot {
     pub antigravity_quotas: Vec<ExternalAntigravityQuota>,
     #[serde(default)]
     pub providers: Vec<ExternalProviderSummary>,
+    #[serde(default)]
+    pub opencode_go: Option<OpenCodeGoDetail>,
+    #[serde(default)]
+    pub maxplus: Option<MaxPlusDetail>,
+    #[serde(default)]
+    pub tokenme: Option<TokenMeDetail>,
+    #[serde(default)]
+    pub firecrawl: Option<FirecrawlDetail>,
 }
 
 /// Rich view-model for one account row (shared by CLI and GPUI).
