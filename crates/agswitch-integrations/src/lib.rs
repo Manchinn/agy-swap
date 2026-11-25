@@ -1,16 +1,20 @@
 use std::collections::HashMap;
 use std::fs;
-use std::io::{BufRead, BufReader, Read};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Mutex;
-use std::time::{Duration as StdDuration, SystemTime};
+use std::time::{Duration as StdDuration, Instant, SystemTime};
 
 use agswitch_engine::domain;
 use agswitch_engine::spec::{
-    AccountProfile, LaunchSpec, RunningInstance, TranscriptFeed, TranscriptStep,
+    AccountProfile, ExternalTelemetrySnapshot, LaunchSpec, RunningInstance, TranscriptFeed,
+    TranscriptStep,
 };
-use agswitch_engine::{BoxFut, ClockPort, ProcessPort, TranscriptPort, WorkspaceLinkPort};
+use agswitch_engine::{
+    BoxFut, ClockPort, ProcessPort, TelemetryFeedPort, TranscriptPort, WorkspaceLinkPort,
+};
 use agswitch_primitives::{AppError, RuntimeOs};
 use chrono::{DateTime, Duration, Utc};
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System, UpdateKind};
@@ -889,6 +893,211 @@ pub fn open_directory_in_file_manager(dir: &Path) -> Result<(), AppError> {
     Ok(())
 }
 
+/// Default local telemetry server base URL (overrideable via `AGSWITCH_TELEMETRY_URL`).
+pub fn default_telemetry_base_url() -> String {
+    if let Ok(raw) = std::env::var("AGSWITCH_TELEMETRY_URL") {
+        let trimmed = raw.trim().trim_end_matches('/');
+        if !trimmed.is_empty() {
+            return trimmed.to_owned();
+        }
+    }
+    "http://127.0.0.1:8289".to_owned()
+}
+
+/// Default local JSON fallback path for `ai-usage-tracker` (overrideable via `AGSWITCH_TELEMETRY_FILE`).
+pub fn default_telemetry_file_path() -> PathBuf {
+    if let Ok(raw) = std::env::var("AGSWITCH_TELEMETRY_FILE")
+        && !raw.trim().is_empty()
+    {
+        return PathBuf::from(raw.trim());
+    }
+    primary_home_dir()
+        .join("opendesign")
+        .join("mockups")
+        .join("ai-usage-tracker")
+        .join("usage-data.json")
+}
+
+/// Open a strictly validated loopback HTTP URL (`http://127.0.0.1:...` or `http://localhost:...`)
+/// in the default desktop browser (e.g. Full Console or Mini HUD Strip).
+pub fn open_local_url(url: &str) -> Result<(), AppError> {
+    let trimmed = url.trim();
+    let is_loopback = trimmed.starts_with("http://127.0.0.1:")
+        || trimmed.starts_with("http://localhost:");
+    if !is_loopback
+        || trimmed.contains('"')
+        || trimmed.contains('&')
+        || trimmed.contains('|')
+        || trimmed.contains(';')
+        || trimmed.contains('\n')
+        || trimmed.contains('\r')
+    {
+        return Err(AppError::Validation(
+            "only clean http://127.0.0.1 or http://localhost URLs may be opened".to_owned(),
+        ));
+    }
+
+    #[cfg(target_os = "macos")]
+    let res = Command::new("open").arg(trimmed).spawn();
+    #[cfg(target_os = "windows")]
+    let res = hidden_command("cmd")
+        .args(["/C", "start", "", trimmed])
+        .spawn();
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    let res = Command::new("xdg-open").arg(trimmed).spawn();
+
+    res.map_err(|e| AppError::Integration(format!("open local URL failed: {e}")))?;
+    Ok(())
+}
+
+struct CachedTelemetry {
+    fetched_at: Instant,
+    snapshot: Option<ExternalTelemetrySnapshot>,
+}
+
+/// Read-only loopback bridge adapter for an optional local multi-provider telemetry server
+/// (`http://127.0.0.1:8289/api/usage.json`) with automatic JSON file fallback.
+/// Preserves Rule R2: never touches OAuth tokens, `.env`, or SQLite databases directly.
+pub struct LocalTelemetryBridgeAdapter {
+    base_url: String,
+    fallback_file: PathBuf,
+    cache_ttl: StdDuration,
+    cache: Mutex<Option<CachedTelemetry>>,
+}
+
+impl LocalTelemetryBridgeAdapter {
+    pub fn from_defaults() -> Self {
+        Self::new(
+            default_telemetry_base_url(),
+            default_telemetry_file_path(),
+            StdDuration::from_secs(15),
+        )
+    }
+
+    pub fn new(base_url: String, fallback_file: PathBuf, cache_ttl: StdDuration) -> Self {
+        Self {
+            base_url: base_url.trim_end_matches('/').to_owned(),
+            fallback_file,
+            cache_ttl,
+            cache: Mutex::new(None),
+        }
+    }
+
+    fn fetch_live(&self, force_fresh: bool) -> Option<ExternalTelemetrySnapshot> {
+        let query_path = if force_fresh {
+            "/api/usage.json?fresh=1"
+        } else {
+            "/api/usage.json"
+        };
+        let read_timeout = if force_fresh {
+            StdDuration::from_millis(8_000)
+        } else {
+            StdDuration::from_millis(2_500)
+        };
+
+        if let Some((port, label)) = parse_loopback_port(&self.base_url)
+            && let Some(body) = http_get_loopback(port, query_path, read_timeout)
+            && let Some(snap) = domain::parse_external_telemetry_json(&body, &label)
+        {
+            return Some(snap);
+        }
+
+        // Offline fallback: read last generated usage-data.json (bounded to 4 MB)
+        if let Ok(meta) = fs::metadata(&self.fallback_file)
+            && meta.len() <= 4 * 1024 * 1024
+            && let Ok(raw) = fs::read_to_string(&self.fallback_file)
+            && let Some(snap) = domain::parse_external_telemetry_json(&raw, "usage-data.json")
+        {
+            return Some(snap);
+        }
+
+        None
+    }
+}
+
+impl TelemetryFeedPort for LocalTelemetryBridgeAdapter {
+    fn load_external_telemetry(&self, force_fresh: bool) -> Option<ExternalTelemetrySnapshot> {
+        if !force_fresh
+            && let Ok(guard) = self.cache.lock()
+            && let Some(entry) = guard.as_ref()
+            && entry.fetched_at.elapsed() < self.cache_ttl
+        {
+            return entry.snapshot.clone();
+        }
+
+        let snap = self.fetch_live(force_fresh);
+        if let Ok(mut guard) = self.cache.lock() {
+            *guard = Some(CachedTelemetry {
+                fetched_at: Instant::now(),
+                snapshot: snap.clone(),
+            });
+        }
+        snap
+    }
+}
+
+fn parse_loopback_port(base_url: &str) -> Option<(u16, String)> {
+    let rest = base_url
+        .strip_prefix("http://127.0.0.1:")
+        .or_else(|| base_url.strip_prefix("http://localhost:"))?;
+    let port_str = rest.split('/').next()?;
+    let port: u16 = port_str.parse().ok()?;
+    Some((port, format!("localhost:{port}")))
+}
+
+fn http_get_loopback(port: u16, path: &str, read_timeout: StdDuration) -> Option<String> {
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), port);
+    let mut stream = TcpStream::connect_timeout(&addr, StdDuration::from_millis(350)).ok()?;
+    let _ = stream.set_read_timeout(Some(read_timeout));
+    let _ = stream.set_write_timeout(Some(StdDuration::from_millis(350)));
+
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAccept: application/json\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).ok()?;
+
+    let mut raw = Vec::new();
+    let mut limited = stream.take(4 * 1024 * 1024);
+    limited.read_to_end(&mut raw).ok()?;
+
+    let sep = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
+    let header_bytes = raw.get(..sep)?;
+    let body_bytes = raw.get(sep + 4..)?;
+    let headers = std::str::from_utf8(header_bytes).ok()?;
+    let status_line = headers.lines().next()?;
+    if !status_line.contains(" 200 ") {
+        return None;
+    }
+
+    if headers
+        .to_ascii_lowercase()
+        .contains("transfer-encoding: chunked")
+    {
+        let decoded = decode_chunked_body(body_bytes)?;
+        String::from_utf8(decoded).ok()
+    } else {
+        String::from_utf8(body_bytes.to_vec()).ok()
+    }
+}
+
+fn decode_chunked_body(mut input: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::new();
+    loop {
+        let crlf = input.windows(2).position(|w| w == b"\r\n")?;
+        let size_line = std::str::from_utf8(input.get(..crlf)?).ok()?;
+        let hex_part = size_line.split(';').next()?.trim();
+        let size = usize::from_str_radix(hex_part, 16).ok()?;
+        input = input.get(crlf + 2..)?;
+        if size == 0 {
+            break;
+        }
+        let chunk = input.get(..size)?;
+        out.extend_from_slice(chunk);
+        input = input.get(size + 2..)?;
+    }
+    Some(out)
+}
+
 /// Safe in-memory / temp-folder sandbox adapters so users and automated tests can exercise
 /// Switch, Alongside, Stop, Add, Cooldown, Shared Chats, and Rules R1–R5 without ever touching
 /// the real Antigravity application or `~/.gemini`.
@@ -900,10 +1109,11 @@ pub mod sandbox {
 
     use agswitch_engine::domain;
     use agswitch_engine::spec::{
-        AccountProfile, LaunchSpec, RunningInstance, SwitcherConfig, TranscriptFeed,
-        TranscriptStep, UsageLedger,
+        AccountProfile, ExternalAntigravityQuota, ExternalProviderSummary,
+        ExternalTelemetrySnapshot, LaunchSpec, RunningInstance, ServerQuotaBucket, SwitcherConfig,
+        TranscriptFeed, TranscriptStep, UsageLedger,
     };
-    use agswitch_engine::{BoxFut, ProcessPort, TranscriptPort};
+    use agswitch_engine::{BoxFut, ProcessPort, TelemetryFeedPort, TranscriptPort};
     use agswitch_primitives::{AccountId, AccountTier, AppError, RuntimeOs};
     use chrono::{DateTime, Duration, Utc};
 
@@ -1262,6 +1472,116 @@ pub mod sandbox {
         }
     }
 
+    /// Deterministic sandbox telemetry feed showcasing live multi-provider cards & exact server quotas
+    /// without contacting localhost or reading real host files.
+    #[derive(Debug, Default)]
+    pub struct SandboxTelemetryAdapter;
+
+    impl TelemetryFeedPort for SandboxTelemetryAdapter {
+        fn load_external_telemetry(&self, _force_fresh: bool) -> Option<ExternalTelemetrySnapshot> {
+            let now = Utc::now();
+            let g_reset = (now + Duration::minutes(164)).to_rfc3339();
+            let cg_reset = (now + Duration::minutes(118)).to_rfc3339();
+            Some(ExternalTelemetrySnapshot {
+                connected: true,
+                source_label: "sandbox-bridge".to_owned(),
+                updated_at: now.format("%Y-%m-%d %H:%M UTC").to_string(),
+                burn_per_day_usd: Some(1.85),
+                runway_days: Some(16.2),
+                antigravity_quotas: vec![
+                    ExternalAntigravityQuota {
+                        name: "SC".to_owned(),
+                        email: "sc.demo@gmail.com".to_owned(),
+                        ok: true,
+                        gemini_5h: Some(ServerQuotaBucket {
+                            remaining_percent: 82.0,
+                            used_percent: 18.0,
+                            reset_at: g_reset.clone(),
+                        }),
+                        gemini_weekly: Some(ServerQuotaBucket {
+                            remaining_percent: 91.5,
+                            used_percent: 8.5,
+                            reset_at: String::new(),
+                        }),
+                        claude_gpt_5h: Some(ServerQuotaBucket {
+                            remaining_percent: 64.0,
+                            used_percent: 36.0,
+                            reset_at: cg_reset.clone(),
+                        }),
+                        claude_gpt_weekly: Some(ServerQuotaBucket {
+                            remaining_percent: 78.0,
+                            used_percent: 22.0,
+                            reset_at: String::new(),
+                        }),
+                    },
+                    ExternalAntigravityQuota {
+                        name: "Trade".to_owned(),
+                        email: "trade.demo@gmail.com".to_owned(),
+                        ok: true,
+                        gemini_5h: Some(ServerQuotaBucket {
+                            remaining_percent: 100.0,
+                            used_percent: 0.0,
+                            reset_at: String::new(),
+                        }),
+                        gemini_weekly: Some(ServerQuotaBucket {
+                            remaining_percent: 96.0,
+                            used_percent: 4.0,
+                            reset_at: String::new(),
+                        }),
+                        claude_gpt_5h: Some(ServerQuotaBucket {
+                            remaining_percent: 85.0,
+                            used_percent: 15.0,
+                            reset_at: cg_reset,
+                        }),
+                        claude_gpt_weekly: Some(ServerQuotaBucket {
+                            remaining_percent: 88.0,
+                            used_percent: 12.0,
+                            reset_at: String::new(),
+                        }),
+                    },
+                ],
+                providers: vec![
+                    ExternalProviderSummary {
+                        id: "maxplus".to_owned(),
+                        name: "MaxPlus".to_owned(),
+                        ok: true,
+                        headline: "$29.90 credit".to_owned(),
+                        subline: "24h $1.40 · 7d $9.80 · 16.2d runway".to_owned(),
+                        remaining_percent: Some(59.8),
+                        status_badge: "LIVE".to_owned(),
+                    },
+                    ExternalProviderSummary {
+                        id: "opencode_go".to_owned(),
+                        name: "OpenCode Go".to_owned(),
+                        ok: true,
+                        headline: "5h 18% · Wk 24%".to_owned(),
+                        subline: "Mo 12% used · 148 reqs".to_owned(),
+                        remaining_percent: Some(76.0),
+                        status_badge: "LIVE".to_owned(),
+                    },
+                    ExternalProviderSummary {
+                        id: "tokenme".to_owned(),
+                        name: "TokenMe".to_owned(),
+                        ok: true,
+                        headline: "Cycle 38% elapsed".to_owned(),
+                        subline: "312 reqs · 4.2M · 19d left".to_owned(),
+                        remaining_percent: Some(62.0),
+                        status_badge: "LIVE".to_owned(),
+                    },
+                    ExternalProviderSummary {
+                        id: "firecrawl".to_owned(),
+                        name: "Firecrawl".to_owned(),
+                        ok: true,
+                        headline: "420 / 500 credits".to_owned(),
+                        subline: "80 used · 84% remaining".to_owned(),
+                        remaining_percent: Some(84.0),
+                        status_badge: "LIVE".to_owned(),
+                    },
+                ],
+            })
+        }
+    }
+
     fn demo_step(
         ts: DateTime<Utc>,
         model: &str,
@@ -1371,6 +1691,35 @@ mod tests {
             .map_err(|e| e.to_string())?;
         assert!(!vault_root.exists());
         assert!(precious_skill.exists());
+        Ok(())
+    }
+
+    #[test]
+    fn telemetry_bridge_falls_back_to_local_json_and_validates_loopback_urls() -> Result<(), String> {
+        let tmp = tempfile::tempdir().map_err(|e| e.to_string())?;
+        let json_path = tmp.path().join("usage-data.json");
+        fs::write(
+            &json_path,
+            r#"{"meta":{"timestamp_bkk":"2026-11-25 14:30"},"maxplus":{"credit_usd":19.5}}"#,
+        )
+        .map_err(|e| e.to_string())?;
+
+        // Use an unreachable loopback port so the adapter exercises its file fallback path
+        let adapter = LocalTelemetryBridgeAdapter::new(
+            "http://127.0.0.1:1".to_owned(),
+            json_path,
+            StdDuration::from_secs(10),
+        );
+        let snap = adapter
+            .load_external_telemetry(true)
+            .ok_or_else(|| "expected file fallback snapshot".to_owned())?;
+        assert!(snap.connected);
+        assert_eq!(snap.source_label, "usage-data.json");
+        assert_eq!(snap.providers.len(), 1);
+
+        // Reject external or shell-injected URLs
+        assert!(open_local_url("https://example.com").is_err());
+        assert!(open_local_url("http://127.0.0.1:8289/a&calc.exe").is_err());
         Ok(())
     }
 }

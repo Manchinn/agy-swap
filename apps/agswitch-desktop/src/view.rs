@@ -6,7 +6,9 @@ use std::time::{Duration, Instant};
 
 use agswitch_domain::{format_clock_hm, format_tokens, is_child_process};
 use agswitch_engine::Engine;
-use agswitch_integrations::open_directory_in_file_manager;
+use agswitch_integrations::{
+    default_telemetry_base_url, open_directory_in_file_manager, open_local_url,
+};
 use agswitch_primitives::{AccountTier, AppError, ModelFamily, PhaseId};
 use agswitch_spec::{
     AccountView, AddAccountInput, AuditEntry, AuditOutcome, CallerContext, CommandRequest,
@@ -65,6 +67,7 @@ enum PopoverPage {
     AccountForm,
     RulesAndAudit,
     PhosphorLab,
+    Providers,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -330,6 +333,11 @@ impl AgSwitchView {
                     light_theme = false;
                     compact_mode = false;
                     initial_page = PopoverPage::RulesAndAudit;
+                }
+                "providers" => {
+                    light_theme = false;
+                    compact_mode = false;
+                    initial_page = PopoverPage::Providers;
                 }
                 _ => {}
             }
@@ -817,6 +825,7 @@ impl AgSwitchView {
                     .map_or("Orb", |a| a.display_name.as_str());
                 format!("PHOSPHOR Orb · {target}")
             }
+            PopoverPage::Providers => "Providers & Live Telemetry".to_owned(),
         };
 
         let left = if show_back {
@@ -990,7 +999,7 @@ impl AgSwitchView {
                     .hover(|s| s.text_color(p.text_primary))
                     .on_click(cx.listener(|v, _, _, cx| {
                         v.run_command(
-                            CommandRequest::GetDashboard,
+                            CommandRequest::RefreshTelemetry,
                             CallerContext::local_interactive(),
                             PhaseId::CheckingPolicy,
                             cx,
@@ -1249,6 +1258,10 @@ impl AgSwitchView {
             .render_matrix("split-orb", LedSpec::hero_7x7(orb_mode, orb_theme, 0.0));
 
         let is_sel_cd = selected_acc.as_ref().is_some_and(|a| a.is_on_cooldown);
+        let has_server_quota = selected_acc
+            .as_ref()
+            .and_then(|a| a.server_quota.as_ref())
+            .is_some_and(|sq| sq.ok);
         let models = selected_acc
             .as_ref()
             .map(|a| a.models.clone())
@@ -1259,34 +1272,41 @@ impl AgSwitchView {
         let g_clock = format_clock_hm(g_secs);
         let cg_clock = format_clock_hm(cg_secs);
 
-        let g_theme = timer_bar_theme(g_secs, is_sel_cd, PhosphorTheme::Cyan);
-        let cg_theme = timer_bar_theme(cg_secs, is_sel_cd, PhosphorTheme::Emerald);
+        let g_theme = if has_server_quota && models.gemini_remaining_5h_pct <= 15.0 {
+            PhosphorTheme::Amber
+        } else {
+            timer_bar_theme(g_secs, is_sel_cd, PhosphorTheme::Cyan)
+        };
+        let cg_theme = if has_server_quota && models.claude_gpt_remaining_5h_pct <= 15.0 {
+            PhosphorTheme::Amber
+        } else {
+            timer_bar_theme(cg_secs, is_sel_cd, PhosphorTheme::Emerald)
+        };
 
         let g_digits = dot_matrix_readout(&g_clock, 1.7, 0.6, p.digit_lit, p.digit_unlit);
         let cg_digits = dot_matrix_readout(&cg_clock, 1.7, 0.6, p.digit_lit, p.digit_unlit);
-        let g_bar = segmented_led_bar(
-            18,
-            window_5h_fraction(g_secs),
-            g_theme,
-            p.led_unlit,
-            15.0,
-            5.5,
-            3.0,
-        );
-        let cg_bar = segmented_led_bar(
-            18,
-            window_5h_fraction(cg_secs),
-            cg_theme,
-            p.led_unlit,
-            15.0,
-            5.5,
-            3.0,
-        );
+        let g_fraction = if has_server_quota {
+            percent_to_f32_fraction(models.gemini_remaining_5h_pct)
+        } else {
+            window_5h_fraction(g_secs)
+        };
+        let cg_fraction = if has_server_quota {
+            percent_to_f32_fraction(models.claude_gpt_remaining_5h_pct)
+        } else {
+            window_5h_fraction(cg_secs)
+        };
+        let g_bar = segmented_led_bar(18, g_fraction, g_theme, p.led_unlit, 15.0, 5.5, 3.0);
+        let cg_bar = segmented_led_bar(18, cg_fraction, cg_theme, p.led_unlit, 15.0, 5.5, 3.0);
 
         let g_unit = timer_unit_label(g_secs, is_sel_cd);
         let cg_unit = timer_unit_label(cg_secs, is_sel_cd);
 
-        let g_sub_left = if models.gemini_calls_5h > 0 {
+        let g_sub_left = if has_server_quota {
+            format!(
+                "5h: {:.0}% left · Wk: {:.0}%",
+                models.gemini_remaining_5h_pct, models.gemini_remaining_7d_pct
+            )
+        } else if models.gemini_calls_5h > 0 {
             format!("5h: {} calls", models.gemini_calls_5h)
         } else {
             "5h: 0 calls · ready".to_owned()
@@ -1298,7 +1318,12 @@ impl AgSwitchView {
         );
 
         let cg_calls_5h = models.claude_calls_5h.saturating_add(models.gpt_calls_5h);
-        let cg_sub_left = if cg_calls_5h > 0 {
+        let cg_sub_left = if has_server_quota {
+            format!(
+                "5h: {:.0}% left · Wk: {:.0}%",
+                models.claude_gpt_remaining_5h_pct, models.claude_gpt_remaining_7d_pct
+            )
+        } else if cg_calls_5h > 0 {
             format!("5h: {cg_calls_5h} calls")
         } else {
             "5h: 0 calls · ready".to_owned()
@@ -1498,10 +1523,35 @@ impl AgSwitchView {
                     .justify_between()
                     .child(
                         div()
-                            .text_size(px(9.5))
-                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                            .text_color(p.text_muted)
-                            .child("LOCAL 5H WINDOW · TIMER"),
+                            .flex()
+                            .items_center()
+                            .gap(px(5.0))
+                            .child(
+                                div()
+                                    .w(px(5.5))
+                                    .h(px(5.5))
+                                    .rounded(px(999.0))
+                                    .bg(if has_server_quota {
+                                        p.status_ok
+                                    } else {
+                                        p.text_muted
+                                    }),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(if has_server_quota {
+                                        p.status_ok
+                                    } else {
+                                        p.text_muted
+                                    })
+                                    .child(if has_server_quota {
+                                        "LIVE SERVER QUOTA · 5H & WK"
+                                    } else {
+                                        "LOCAL 5H WINDOW · TIMER"
+                                    }),
+                            ),
                     )
                     .child(
                         div()
@@ -1948,9 +1998,47 @@ impl AgSwitchView {
             .and_then(|pid| self.profile_orbs.get(pid))
             .copied();
 
+        let bridge_live = snap
+            .external_telemetry
+            .as_ref()
+            .is_some_and(|t| t.connected);
+
         let right_footer = div()
             .flex()
-            .gap(px(8.0))
+            .gap(px(6.0))
+            .child(
+                div()
+                    .id("right-providers-btn")
+                    .flex_1()
+                    .h(px(32.0))
+                    .rounded(px(9.0))
+                    .bg(p.btn_dark)
+                    .border_1()
+                    .border_color(if bridge_live {
+                        p.status_ok
+                    } else {
+                        p.border_hairline
+                    })
+                    .text_size(px(10.0))
+                    .text_color(if bridge_live {
+                        p.status_ok
+                    } else {
+                        p.text_secondary
+                    })
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .cursor_pointer()
+                    .hover(|s| s.text_color(p.text_primary))
+                    .on_click(cx.listener(|v, _, window, cx| {
+                        v.navigate_to(PopoverPage::Providers, window, cx);
+                    }))
+                    .child(if bridge_live {
+                        "● Providers ›"
+                    } else {
+                        "Providers ›"
+                    }),
+            )
             .child(
                 div()
                     .id("right-lab-btn")
@@ -3664,6 +3752,31 @@ impl AgSwitchView {
                     )
                     .child(
                         div()
+                            .id("set-providers")
+                            .h(px(34.0))
+                            .px(px(10.0))
+                            .rounded(px(8.0))
+                            .bg(p.btn_dark)
+                            .border_1()
+                            .border_color(p.border_subtle)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(p.border_outer))
+                            .on_click(cx.listener(|v, _, window, cx| {
+                                v.navigate_to(PopoverPage::Providers, window, cx);
+                            }))
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .text_color(p.text_primary)
+                                    .child("Providers & Live Telemetry"),
+                            )
+                            .child(div().text_size(px(11.0)).text_color(p.text_muted).child("›")),
+                    )
+                    .child(
+                        div()
                             .id("set-orb-lab")
                             .h(px(34.0))
                             .px(px(10.0))
@@ -4378,6 +4491,398 @@ impl AgSwitchView {
             .justify_center()
             .child(card)
     }
+
+    fn render_providers_page(
+        &self,
+        snap: &DashboardSnapshot,
+        p: &SamoPalette,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let ext = snap.external_telemetry.as_ref().filter(|t| t.connected);
+        let base_url = default_telemetry_base_url();
+        let console_url = format!("{base_url}/opendesign/mockups/ai-usage-tracker/index.html");
+        let mini_hud_url =
+            format!("{base_url}/opendesign/mockups/ai-usage-tracker/widget.html?mode=mini");
+
+        let (status_badge, status_col, status_bg, sub_meta) = if let Some(t) = ext {
+            let mut parts = vec![format!("Source: {}", t.source_label)];
+            if !t.updated_at.is_empty() {
+                parts.push(t.updated_at.clone());
+            }
+            if let Some(burn) = t.burn_per_day_usd {
+                parts.push(format!("Burn ${burn:.2}/d"));
+            }
+            if let Some(rw) = t.runway_days {
+                parts.push(format!("{rw:.1}d runway"));
+            }
+            (
+                "BRIDGE LIVE",
+                p.status_ok,
+                rgba(0x34D3_9922),
+                parts.join(" · "),
+            )
+        } else {
+            (
+                "BRIDGE OFFLINE",
+                p.status_warn,
+                rgba(0xFBBF_2422),
+                format!(
+                    "Start local tracker on {base_url} or set AGSWITCH_TELEMETRY_FILE"
+                ),
+            )
+        };
+
+        let top_bar = div()
+            .p(px(12.0))
+            .rounded(px(12.0))
+            .bg(p.card_bg)
+            .border_1()
+            .border_color(p.border_hairline)
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap(px(10.0))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap(px(3.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .px(px(6.0))
+                                    .py(px(1.5))
+                                    .rounded(px(4.0))
+                                    .bg(status_bg)
+                                    .text_size(px(8.5))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(status_col)
+                                    .child(status_badge),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(11.0))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(p.text_primary)
+                                    .child("Multi-Provider Telemetry"),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .whitespace_nowrap()
+                            .text_size(px(9.5))
+                            .text_color(p.text_muted)
+                            .child(clip_text(&sub_meta, 56)),
+                    ),
+            )
+            .child(
+                div()
+                    .flex_shrink_0()
+                    .flex()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .id("prov-refresh-btn")
+                            .h(px(28.0))
+                            .px(px(9.0))
+                            .rounded(px(7.0))
+                            .bg(p.btn_dark)
+                            .border_1()
+                            .border_color(p.border_hairline)
+                            .text_size(px(10.0))
+                            .text_color(p.text_primary)
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(p.border_outer))
+                            .on_click(cx.listener(|v, _, _, cx| {
+                                v.run_command(
+                                    CommandRequest::RefreshTelemetry,
+                                    CallerContext::local_interactive(),
+                                    PhaseId::CheckingPolicy,
+                                    cx,
+                                );
+                            }))
+                            .child("↻ Fresh"),
+                    )
+                    .child(
+                        div()
+                            .id("prov-console-btn")
+                            .h(px(28.0))
+                            .px(px(9.0))
+                            .rounded(px(7.0))
+                            .bg(p.btn_dark)
+                            .border_1()
+                            .border_color(p.border_hairline)
+                            .text_size(px(10.0))
+                            .text_color(p.accent_cyan)
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .hover(|s| s.border_color(p.accent_cyan))
+                            .on_click(cx.listener(move |v, _, _, cx| {
+                                v.toast_line = Some(match open_local_url(&console_url) {
+                                    Ok(()) => "Opened Full Console ↗".to_owned(),
+                                    Err(e) => e.to_string(),
+                                });
+                                cx.notify();
+                            }))
+                            .child("Console ↗"),
+                    )
+                    .child(
+                        div()
+                            .id("prov-hud-btn")
+                            .h(px(28.0))
+                            .px(px(9.0))
+                            .rounded(px(7.0))
+                            .bg(p.pearl_bg)
+                            .text_size(px(10.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.pearl_fg)
+                            .flex()
+                            .items_center()
+                            .cursor_pointer()
+                            .on_click(cx.listener(move |v, _, _, cx| {
+                                v.toast_line = Some(match open_local_url(&mini_hud_url) {
+                                    Ok(()) => "Opened Mini HUD Strip ↗".to_owned(),
+                                    Err(e) => e.to_string(),
+                                });
+                                cx.notify();
+                            }))
+                            .child("Mini HUD ↗"),
+                    ),
+            );
+
+        let mut content = div()
+            .id("providers-scroll")
+            .flex_1()
+            .min_w_0()
+            .overflow_y_scroll()
+            .p(px(14.0))
+            .flex()
+            .flex_col()
+            .gap(px(12.0))
+            .child(top_bar);
+
+        if let Some(t) = ext {
+            // 2-Column Provider Grid
+            if !t.providers.is_empty() {
+                let mut rows_col = div().flex().flex_col().gap(px(8.0));
+                for pair in t.providers.chunks(2) {
+                    let mut row = div().flex().flex_row().gap(px(8.0));
+                    for prov in pair {
+                        let (badge_col, badge_bg, led_theme) = match prov.status_badge.as_str() {
+                            "LOW" => (p.status_danger, rgba(0xFF5A_4722), PhosphorTheme::Red),
+                            "WARN" => (p.status_warn, rgba(0xFBBF_2422), PhosphorTheme::Amber),
+                            "OFF" => (p.text_muted, rgba(0xFFFF_FF10), PhosphorTheme::White),
+                            _ => (p.status_ok, rgba(0x34D3_9922), PhosphorTheme::Emerald),
+                        };
+                        let mut card = div()
+                            .flex_1()
+                            .min_w_0()
+                            .p(px(11.0))
+                            .rounded(px(11.0))
+                            .bg(p.card_bg)
+                            .border_1()
+                            .border_color(p.border_hairline)
+                            .flex()
+                            .flex_col()
+                            .gap(px(6.0))
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .justify_between()
+                                    .child(
+                                        div()
+                                            .text_size(px(11.5))
+                                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                                            .text_color(p.text_primary)
+                                            .child(prov.name.clone()),
+                                    )
+                                    .child(
+                                        div()
+                                            .px(px(5.5))
+                                            .py(px(1.5))
+                                            .rounded(px(4.0))
+                                            .bg(badge_bg)
+                                            .text_size(px(8.0))
+                                            .font_weight(gpui::FontWeight::BOLD)
+                                            .text_color(badge_col)
+                                            .child(prov.status_badge.clone()),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(13.0))
+                                    .font_weight(gpui::FontWeight::BOLD)
+                                    .text_color(p.text_primary)
+                                    .child(clip_text(&prov.headline, 28)),
+                            );
+
+                        if let Some(pct) = prov.remaining_percent {
+                            card = card.child(segmented_led_bar(
+                                16,
+                                percent_to_f32_fraction(pct),
+                                led_theme,
+                                p.led_unlit,
+                                11.0,
+                                4.5,
+                                2.5,
+                            ));
+                        }
+
+                        card = card.child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(px(9.5))
+                                .text_color(p.text_muted)
+                                .child(clip_text(&prov.subline, 38)),
+                        );
+
+                        row = row.child(card);
+                    }
+                    if pair.len() == 1 {
+                        row = row.child(div().flex_1());
+                    }
+                    rows_col = rows_col.child(row);
+                }
+                content = content.child(rows_col);
+            }
+
+            // Tracked Antigravity Server Quotas
+            if !t.antigravity_quotas.is_empty() {
+                let mut ag_card = div()
+                    .p(px(12.0))
+                    .rounded(px(12.0))
+                    .bg(p.card_bg)
+                    .border_1()
+                    .border_color(p.border_hairline)
+                    .flex()
+                    .flex_col()
+                    .gap(px(8.0))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                                    .text_color(p.text_muted)
+                                    .child("ANTIGRAVITY SERVER QUOTAS (5H / WEEKLY)"),
+                            )
+                            .child(
+                                div()
+                                    .text_size(px(9.5))
+                                    .text_color(p.text_muted)
+                                    .child(format!("{} accounts", t.antigravity_quotas.len())),
+                            ),
+                    );
+
+                for q in &t.antigravity_quotas {
+                    let display_id = if !q.email.is_empty() {
+                        format_email_display(&q.email, false, self.hide_emails)
+                    } else {
+                        q.name.clone()
+                    };
+                    let g5 = q
+                        .gemini_5h
+                        .as_ref()
+                        .map_or_else(|| "–".to_owned(), |b| format!("{:.0}%", b.remaining_percent));
+                    let gw = q
+                        .gemini_weekly
+                        .as_ref()
+                        .map_or_else(|| "–".to_owned(), |b| format!("{:.0}%", b.remaining_percent));
+                    let cg5 = q
+                        .claude_gpt_5h
+                        .as_ref()
+                        .map_or_else(|| "–".to_owned(), |b| format!("{:.0}%", b.remaining_percent));
+                    let cgw = q
+                        .claude_gpt_weekly
+                        .as_ref()
+                        .map_or_else(|| "–".to_owned(), |b| format!("{:.0}%", b.remaining_percent));
+
+                    ag_card = ag_card.child(
+                        div()
+                            .px(px(10.0))
+                            .py(px(7.0))
+                            .rounded(px(8.0))
+                            .bg(p.row_bg)
+                            .border_1()
+                            .border_color(p.border_subtle)
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .gap(px(8.0))
+                            .child(
+                                div()
+                                    .text_size(px(10.5))
+                                    .font_weight(gpui::FontWeight::MEDIUM)
+                                    .text_color(p.text_primary)
+                                    .child(clip_text(&display_id, 28)),
+                            )
+                            .child(
+                                div()
+                                    .flex()
+                                    .items_center()
+                                    .gap(px(10.0))
+                                    .text_size(px(10.0))
+                                    .child(
+                                        div()
+                                            .text_color(p.accent_cyan)
+                                            .child(format!("G {g5} / {gw}w")),
+                                    )
+                                    .child(
+                                        div()
+                                            .text_color(p.status_ok)
+                                            .child(format!("C&G {cg5} / {cgw}w")),
+                                    ),
+                            ),
+                    );
+                }
+
+                content = content.child(ag_card);
+            }
+        } else {
+            content = content.child(
+                div()
+                    .p(px(16.0))
+                    .rounded(px(12.0))
+                    .bg(p.card_bg)
+                    .border_1()
+                    .border_color(p.border_hairline)
+                    .flex()
+                    .flex_col()
+                    .gap(px(6.0))
+                    .child(
+                        div()
+                            .text_size(px(12.0))
+                            .font_weight(gpui::FontWeight::SEMIBOLD)
+                            .text_color(p.text_primary)
+                            .child("Local Telemetry Bridge not connected"),
+                    )
+                    .child(
+                        div()
+                            .text_size(px(10.5))
+                            .text_color(p.text_secondary)
+                            .child(
+                                "AGY Swap works standalone with local 5h timers (Zero OAuth). To overlay live multi-provider credits and exact server quotas, start your local AI Usage Tracker server on localhost:8289 or click ↻ Fresh.",
+                            ),
+                    ),
+            );
+        }
+
+        content.into_any_element()
+    }
 }
 
 impl Render for AgSwitchView {
@@ -4414,6 +4919,7 @@ impl Render for AgSwitchView {
                 self.render_account_detail(&pid, snap, &p, cx)
             }
             (Some(snap), PopoverPage::RulesAndAudit) => self.render_rules_and_audit(snap, &p),
+            (Some(snap), PopoverPage::Providers) => self.render_providers_page(snap, &p, cx),
         };
 
         let mut root = div()
@@ -4510,6 +5016,13 @@ fn window_5h_fraction(secs: Option<u64>) -> f32 {
     let clamped = remaining.min(18_000);
     let secs_u16 = u16::try_from(clamped).unwrap_or(18_000);
     f32::from(secs_u16) / 18_000.0
+}
+
+/// Converts a `0.0..=100.0` remaining percentage into a `0.0..=1.0` LED bar fill fraction without `as` casts.
+fn percent_to_f32_fraction(pct: f64) -> f32 {
+    let clamped = pct.clamp(0.0, 100.0);
+    let parsed: f32 = format!("{clamped:.1}").parse().unwrap_or(0.0);
+    (parsed / 100.0).clamp(0.0, 1.0)
 }
 
 fn timer_bar_theme(

@@ -2,11 +2,11 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::Arc;
 
-use agswitch_engine::{Engine, EngineDefaults, ProcessPort, TranscriptPort};
+use agswitch_engine::{Engine, EngineDefaults, ProcessPort, TelemetryFeedPort, TranscriptPort};
 use agswitch_integrations::{
-    OsProcessAdapter, OsTranscriptAdapter, OsWorkspaceLinkAdapter, SystemClockAdapter,
-    default_antigravity_bin_path, default_data_dir, default_profiles_root_dir, primary_home_dir,
-    sandbox,
+    LocalTelemetryBridgeAdapter, OsProcessAdapter, OsTranscriptAdapter, OsWorkspaceLinkAdapter,
+    SystemClockAdapter, default_antigravity_bin_path, default_data_dir, default_profiles_root_dir,
+    primary_home_dir, sandbox,
 };
 use agswitch_primitives::{AccountTier, RuntimeOs};
 use agswitch_spec::{
@@ -87,6 +87,8 @@ enum Commands {
         #[arg(long, default_value_t = 20)]
         limit: usize,
     },
+    /// Force-refresh external local telemetry bridge and print status
+    Refresh,
 }
 
 #[tokio::main]
@@ -106,6 +108,7 @@ async fn main() -> ExitCode {
         let proc_adapter: Arc<dyn ProcessPort> =
             Arc::new(sandbox::SandboxProcessAdapter::new(paths.running_state_file));
         let tx_adapter: Arc<dyn TranscriptPort> = Arc::new(sandbox::SandboxTranscriptAdapter);
+        let tel_adapter: Arc<dyn TelemetryFeedPort> = Arc::new(sandbox::SandboxTelemetryAdapter);
         Engine::new(
             EngineDefaults {
                 profiles_root_dir: paths.profiles_root.to_string_lossy().into_owned(),
@@ -118,6 +121,7 @@ async fn main() -> ExitCode {
             tx_adapter,
             Arc::new(SystemClockAdapter),
         )
+        .with_telemetry(tel_adapter)
     } else {
         let data_dir = default_data_dir();
         let profiles_root = default_profiles_root_dir(&data_dir);
@@ -134,6 +138,7 @@ async fn main() -> ExitCode {
             Arc::new(OsTranscriptAdapter::new(primary_home)),
             Arc::new(SystemClockAdapter),
         )
+        .with_telemetry(Arc::new(LocalTelemetryBridgeAdapter::from_defaults()))
     };
 
     let (request, caller) = match cli.command {
@@ -208,6 +213,10 @@ async fn main() -> ExitCode {
         ),
         Commands::Audit { limit } => (
             CommandRequest::ListAudit { limit },
+            CallerContext::local_interactive(),
+        ),
+        Commands::Refresh => (
+            CommandRequest::RefreshTelemetry,
             CallerContext::local_interactive(),
         ),
     };
@@ -293,8 +302,21 @@ fn print_human(resp: &CommandResponse) {
                 } else {
                     format!("reset {}", a.reset_label)
                 };
+                let quota_suffix = if let Some(sq) = &a.server_quota
+                    && sq.ok
+                {
+                    format!(
+                        " | Live Quota: G {:.0}%/{:.0}%w · CG {:.0}%/{:.0}%w",
+                        a.models.gemini_remaining_5h_pct,
+                        a.models.gemini_remaining_7d_pct,
+                        a.models.claude_gpt_remaining_5h_pct,
+                        a.models.claude_gpt_remaining_7d_pct,
+                    )
+                } else {
+                    String::new()
+                };
                 println!(
-                    "  - [{state:<8}] {:<18} ({}) | {} | {} | 5h: {}x ({timer_txt}) | 7d: {}x (G:{} C:{} GPT:{})",
+                    "  - [{state:<8}] {:<18} ({}) | {} | {} | 5h: {}x ({timer_txt}) | 7d: {}x (G:{} C:{} GPT:{}){quota_suffix}",
                     a.display_name,
                     a.id,
                     a.tier.badge(),
@@ -305,6 +327,20 @@ fn print_human(resp: &CommandResponse) {
                     a.models.claude_calls_7d,
                     a.models.gpt_calls_7d,
                 );
+            }
+            if let Some(ext) = &d.external_telemetry
+                && ext.connected
+            {
+                println!(
+                    "\nExternal Telemetry ({} · {}):",
+                    ext.source_label, ext.updated_at
+                );
+                for prov in &ext.providers {
+                    println!(
+                        "  - [{:<4}] {:<12} {} | {}",
+                        prov.status_badge, prov.name, prov.headline, prov.subline
+                    );
+                }
             }
         }
         CommandResponse::Switched {

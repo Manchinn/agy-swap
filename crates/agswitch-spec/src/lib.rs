@@ -21,6 +21,7 @@ pub enum CommandId {
     SetSharedChats,
     ResetLogin,
     ListAudit,
+    RefreshTelemetry,
 }
 
 impl CommandId {
@@ -39,6 +40,7 @@ impl CommandId {
             Self::SetSharedChats => "set_shared_chats",
             Self::ResetLogin => "reset_login",
             Self::ListAudit => "list_audit",
+            Self::RefreshTelemetry => "refresh_telemetry",
         }
     }
 }
@@ -322,6 +324,63 @@ pub struct UsageSnapshot {
     pub active_cache_hit_percent: f64,
 }
 
+/// Single server-reported quota bucket from an optional local telemetry bridge (e.g. `ai-usage-tracker`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ServerQuotaBucket {
+    pub remaining_percent: f64,
+    pub used_percent: f64,
+    #[serde(default)]
+    pub reset_at: String,
+}
+
+/// Optional server-reported Antigravity quota overlay for one account (read-only from local telemetry feed).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternalAntigravityQuota {
+    pub name: String,
+    #[serde(default)]
+    pub email: String,
+    pub ok: bool,
+    #[serde(default)]
+    pub gemini_5h: Option<ServerQuotaBucket>,
+    #[serde(default)]
+    pub gemini_weekly: Option<ServerQuotaBucket>,
+    #[serde(default)]
+    pub claude_gpt_5h: Option<ServerQuotaBucket>,
+    #[serde(default)]
+    pub claude_gpt_weekly: Option<ServerQuotaBucket>,
+}
+
+/// Generic multi-provider summary row read from a local telemetry bridge (zero credentials).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExternalProviderSummary {
+    pub id: String,
+    pub name: String,
+    pub ok: bool,
+    pub headline: String,
+    pub subline: String,
+    #[serde(default)]
+    pub remaining_percent: Option<f64>,
+    pub status_badge: String,
+}
+
+/// Optional snapshot from a local telemetry bridge (`http://127.0.0.1:8289/api/usage.json` or JSON file).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct ExternalTelemetrySnapshot {
+    pub connected: bool,
+    #[serde(default)]
+    pub source_label: String,
+    #[serde(default)]
+    pub updated_at: String,
+    #[serde(default)]
+    pub burn_per_day_usd: Option<f64>,
+    #[serde(default)]
+    pub runway_days: Option<f64>,
+    #[serde(default)]
+    pub antigravity_quotas: Vec<ExternalAntigravityQuota>,
+    #[serde(default)]
+    pub providers: Vec<ExternalProviderSummary>,
+}
+
 /// Rich view-model for one account row (shared by CLI and GPUI).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct AccountView {
@@ -353,6 +412,9 @@ pub struct AccountView {
     #[serde(default)]
     pub reset_in_secs: Option<u64>,
     pub reset_label: String,
+    /// Optional server-side quota overlay matched from the local telemetry bridge.
+    #[serde(default)]
+    pub server_quota: Option<ExternalAntigravityQuota>,
 }
 
 /// Status of an engine-enforced rule surfaced in the UI Rules tab.
@@ -385,6 +447,9 @@ pub struct DashboardSnapshot {
     pub models_7d: ModelUsageBreakdown,
     pub accounts: Vec<AccountView>,
     pub rules: Vec<RuleStatus>,
+    /// Optional multi-provider & server-quota telemetry read from local bridge.
+    #[serde(default)]
+    pub external_telemetry: Option<ExternalTelemetrySnapshot>,
 }
 
 /// Centralized audit outcome recorded by `Engine::execute`.
@@ -452,6 +517,7 @@ pub enum CommandRequest {
     SetSharedChats { profile_id: String, enabled: bool },
     ResetLogin { profile_id: String, launch_alongside: bool },
     ListAudit { limit: usize },
+    RefreshTelemetry,
 }
 
 impl CommandRequest {
@@ -470,6 +536,7 @@ impl CommandRequest {
             Self::SetSharedChats { .. } => CommandId::SetSharedChats,
             Self::ResetLogin { .. } => CommandId::ResetLogin,
             Self::ListAudit { .. } => CommandId::ListAudit,
+            Self::RefreshTelemetry => CommandId::RefreshTelemetry,
         }
     }
 }

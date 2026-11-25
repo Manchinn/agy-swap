@@ -2,8 +2,10 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use agswitch_primitives::{AccountTier, AppError, ModelFamily, RuleId, RuntimeOs};
 use agswitch_spec::{
-    AccountProfile, AccountUsageMetrics, ActiveSessionSpan, LaunchSpec, ModelUsageBreakdown,
-    RuleStatus, SingleModelUsage, TranscriptFeed, TranscriptStep, UsageLedger, UsageSnapshot,
+    AccountProfile, AccountUsageMetrics, ActiveSessionSpan, ExternalAntigravityQuota,
+    ExternalProviderSummary, ExternalTelemetrySnapshot, LaunchSpec, ModelUsageBreakdown,
+    RuleStatus, ServerQuotaBucket, SingleModelUsage, TranscriptFeed, TranscriptStep, UsageLedger,
+    UsageSnapshot,
 };
 use chrono::{DateTime, Duration, Utc};
 
@@ -963,6 +965,449 @@ pub mod policy {
     }
 }
 
+/// Pure parser for an optional local multi-provider telemetry JSON payload (e.g. `ai-usage-tracker`
+/// `/api/usage.json` or `usage-data.json`). Never accesses network, filesystem, or credentials.
+pub fn parse_external_telemetry_json(
+    raw: &str,
+    source_label: &str,
+) -> Option<ExternalTelemetrySnapshot> {
+    let val: serde_json::Value = serde_json::from_str(raw).ok()?;
+    let obj = val.as_object()?;
+
+    let updated_at = obj
+        .get("meta")
+        .and_then(|m| m.get("timestamp_bkk").or_else(|| m.get("timestamp_utc")))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+
+    let burn_per_day_usd = obj
+        .get("burn_rate")
+        .and_then(|b| {
+            b.get("snapshot")
+                .and_then(|s| s.get("burn_per_day"))
+                .and_then(serde_json::Value::as_f64)
+                .filter(|v| *v > 0.0)
+                .or_else(|| {
+                    b.get("router_7d_per_day")
+                        .and_then(serde_json::Value::as_f64)
+                        .filter(|v| *v > 0.0)
+                })
+        });
+
+    let runway_days = obj.get("burn_rate").and_then(|b| {
+        b.get("snapshot")
+            .and_then(|s| s.get("runway_days"))
+            .and_then(serde_json::Value::as_f64)
+            .filter(|v| *v > 0.0)
+            .or_else(|| {
+                b.get("router_7d_runway_days")
+                    .and_then(serde_json::Value::as_f64)
+                    .filter(|v| *v > 0.0)
+            })
+    });
+
+    let mut antigravity_quotas = Vec::new();
+    if let Some(arr) = obj
+        .get("antigravity_quotas")
+        .and_then(serde_json::Value::as_array)
+    {
+        for item in arr {
+            let ok = item
+                .get("ok")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            let name = item
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let email = item
+                .get("email")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_owned();
+            let buckets = item.get("buckets");
+            let gemini_5h = buckets.and_then(|b| parse_server_bucket(b.get("gemini_5h")));
+            let gemini_weekly = buckets.and_then(|b| parse_server_bucket(b.get("gemini_weekly")));
+            let claude_gpt_5h = buckets.and_then(|b| parse_server_bucket(b.get("claude_gpt_5h")));
+            let claude_gpt_weekly =
+                buckets.and_then(|b| parse_server_bucket(b.get("claude_gpt_weekly")));
+
+            if !name.is_empty() || !email.is_empty() {
+                antigravity_quotas.push(ExternalAntigravityQuota {
+                    name,
+                    email,
+                    ok,
+                    gemini_5h,
+                    gemini_weekly,
+                    claude_gpt_5h,
+                    claude_gpt_weekly,
+                });
+            }
+        }
+    }
+
+    let mut providers = Vec::new();
+
+    // 1. MaxPlus
+    if let Some(mp) = obj.get("maxplus").and_then(serde_json::Value::as_object) {
+        let credit = mp
+            .get("credit_usd")
+            .and_then(serde_json::Value::as_f64);
+        let cost_24h = mp
+            .get("periods")
+            .and_then(|p| p.get("24h"))
+            .and_then(|p| p.get("total_cost"))
+            .and_then(serde_json::Value::as_f64);
+        let cost_7d = mp
+            .get("periods")
+            .and_then(|p| p.get("7d"))
+            .and_then(|p| p.get("total_cost"))
+            .and_then(serde_json::Value::as_f64);
+        let keys_count = mp
+            .get("keys")
+            .and_then(serde_json::Value::as_array)
+            .map_or(0, Vec::len);
+        let ok = credit.is_some();
+        let headline = match credit {
+            Some(c) => format!("${c:.2} credit"),
+            None => "Unavailable".to_owned(),
+        };
+        let mut sub_parts = Vec::new();
+        if let Some(c24) = cost_24h {
+            sub_parts.push(format!("24h ${c24:.2}"));
+        }
+        if let Some(c7) = cost_7d {
+            sub_parts.push(format!("7d ${c7:.2}"));
+        }
+        if let Some(runway) = runway_days {
+            sub_parts.push(format!("{runway:.1}d runway"));
+        } else if keys_count > 0 {
+            sub_parts.push(format!("{keys_count} keys"));
+        }
+        let status_badge = match credit {
+            Some(c) if c < 3.0 => "LOW",
+            Some(c) if c < 10.0 => "WARN",
+            Some(_) => "LIVE",
+            None => "OFF",
+        };
+        let rem_pct = credit.map(|c| ((c / 50.0) * 100.0).clamp(0.0, 100.0));
+        providers.push(ExternalProviderSummary {
+            id: "maxplus".to_owned(),
+            name: "MaxPlus".to_owned(),
+            ok,
+            headline,
+            subline: sub_parts.join(" · "),
+            remaining_percent: rem_pct,
+            status_badge: status_badge.to_owned(),
+        });
+    }
+
+    // 2. OpenCode Go
+    if let Some(oc) = obj.get("opencode_go").and_then(serde_json::Value::as_object) {
+        let ok = oc
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let rolling = oc
+            .get("rolling")
+            .and_then(|r| r.get("percent"))
+            .and_then(serde_json::Value::as_f64);
+        let weekly = oc
+            .get("weekly")
+            .and_then(|r| r.get("percent"))
+            .and_then(serde_json::Value::as_f64);
+        let monthly = oc
+            .get("monthly")
+            .and_then(|r| r.get("percent"))
+            .and_then(serde_json::Value::as_f64);
+        let max_used = [rolling, weekly, monthly]
+            .into_iter()
+            .flatten()
+            .fold(0.0_f64, f64::max);
+        let remaining = if ok {
+            Some((100.0 - max_used).clamp(0.0, 100.0))
+        } else {
+            None
+        };
+        let headline = if ok {
+            format!(
+                "5h {:.0}% · Wk {:.0}%",
+                rolling.unwrap_or(0.0),
+                weekly.unwrap_or(0.0)
+            )
+        } else {
+            "Offline".to_owned()
+        };
+        let total_reqs = oc
+            .get("local_usage")
+            .and_then(|l| l.get("combined"))
+            .and_then(|c| c.get("requests"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let subline = format!(
+            "Mo {:.0}% used · {} reqs",
+            monthly.unwrap_or(0.0),
+            total_reqs
+        );
+        let status_badge = if !ok {
+            "OFF"
+        } else if max_used >= 90.0 {
+            "LOW"
+        } else if max_used >= 70.0 {
+            "WARN"
+        } else {
+            "LIVE"
+        };
+        providers.push(ExternalProviderSummary {
+            id: "opencode_go".to_owned(),
+            name: "OpenCode Go".to_owned(),
+            ok,
+            headline,
+            subline,
+            remaining_percent: remaining,
+            status_badge: status_badge.to_owned(),
+        });
+    }
+
+    // 3. TokenMe
+    if let Some(tm) = obj.get("tokenme").and_then(serde_json::Value::as_object) {
+        let elapsed = tm
+            .get("cycle_elapsed_pct")
+            .and_then(serde_json::Value::as_f64)
+            .unwrap_or(0.0)
+            .clamp(0.0, 100.0);
+        let reqs = tm
+            .get("combined_cycle")
+            .and_then(|c| c.get("requests"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let toks = tm
+            .get("combined_cycle")
+            .and_then(|c| c.get("total_tokens"))
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let days_left = tm
+            .get("dec17_days")
+            .and_then(serde_json::Value::as_u64);
+        let headline = format!("Cycle {elapsed:.0}% elapsed");
+        let mut sub = format!("{reqs} reqs · {}", format_tokens(toks));
+        if let Some(d) = days_left {
+            sub.push_str(&format!(" · {d}d left"));
+        }
+        providers.push(ExternalProviderSummary {
+            id: "tokenme".to_owned(),
+            name: "TokenMe".to_owned(),
+            ok: true,
+            headline,
+            subline: sub,
+            remaining_percent: Some((100.0 - elapsed).clamp(0.0, 100.0)),
+            status_badge: "LIVE".to_owned(),
+        });
+    }
+
+    // 4. Firecrawl
+    if let Some(fc) = obj.get("firecrawl").and_then(serde_json::Value::as_object) {
+        let ok = fc
+            .get("ok")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        let rem = fc
+            .get("remaining_credits")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let plan = fc
+            .get("plan_credits")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let rem_pct = fc
+            .get("remaining_percent")
+            .and_then(serde_json::Value::as_f64)
+            .map(|v| v.clamp(0.0, 100.0));
+        let headline = if ok {
+            format!("{rem} / {plan} credits")
+        } else {
+            "Offline".to_owned()
+        };
+        let used = fc
+            .get("used_credits")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        let subline = format!(
+            "{used} used · {:.0}% remaining",
+            rem_pct.unwrap_or(0.0)
+        );
+        let status_badge = if !ok {
+            "OFF"
+        } else if rem_pct.is_some_and(|p| p < 15.0) {
+            "LOW"
+        } else if rem_pct.is_some_and(|p| p < 35.0) {
+            "WARN"
+        } else {
+            "LIVE"
+        };
+        providers.push(ExternalProviderSummary {
+            id: "firecrawl".to_owned(),
+            name: "Firecrawl".to_owned(),
+            ok,
+            headline,
+            subline,
+            remaining_percent: rem_pct,
+            status_badge: status_badge.to_owned(),
+        });
+    }
+
+    Some(ExternalTelemetrySnapshot {
+        connected: true,
+        source_label: source_label.to_owned(),
+        updated_at,
+        burn_per_day_usd,
+        runway_days,
+        antigravity_quotas,
+        providers,
+    })
+}
+
+fn parse_server_bucket(raw: Option<&serde_json::Value>) -> Option<ServerQuotaBucket> {
+    let obj = raw?.as_object()?;
+    let remaining_percent = obj
+        .get("remaining_percent")
+        .and_then(serde_json::Value::as_f64)
+        .or_else(|| {
+            obj.get("remaining_fraction")
+                .and_then(serde_json::Value::as_f64)
+                .map(|f| (f * 100.0).clamp(0.0, 100.0))
+        })?
+        .clamp(0.0, 100.0);
+    let used_percent = obj
+        .get("used_percent")
+        .and_then(serde_json::Value::as_f64)
+        .unwrap_or_else(|| (100.0 - remaining_percent).clamp(0.0, 100.0))
+        .clamp(0.0, 100.0);
+    let reset_at = obj
+        .get("reset_at")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_owned();
+    Some(ServerQuotaBucket {
+        remaining_percent,
+        used_percent,
+        reset_at,
+    })
+}
+
+/// Match an `AccountProfile` to an external server-side Antigravity quota record (pure & case-insensitive).
+pub fn match_external_quota<'a>(
+    profile: &AccountProfile,
+    quotas: &'a [ExternalAntigravityQuota],
+) -> Option<&'a ExternalAntigravityQuota> {
+    let sub = profile.subtitle.trim().to_ascii_lowercase();
+    let name = profile.display_name.trim().to_ascii_lowercase();
+
+    // 1. Exact email match against subtitle or display_name
+    if !sub.is_empty()
+        && let Some(found) = quotas
+            .iter()
+            .find(|q| !q.email.is_empty() && q.email.trim().to_ascii_lowercase() == sub)
+    {
+        return Some(found);
+    }
+    if !name.is_empty()
+        && let Some(found) = quotas
+            .iter()
+            .find(|q| !q.email.is_empty() && q.email.trim().to_ascii_lowercase() == name)
+    {
+        return Some(found);
+    }
+
+    // 2. Email substring match (e.g. subtitle contains "Work (dev@example.com)")
+    if !sub.is_empty()
+        && let Some(found) = quotas
+            .iter()
+            .find(|q| !q.email.is_empty() && sub.contains(&q.email.trim().to_ascii_lowercase()))
+    {
+        return Some(found);
+    }
+
+    // 3. Name match against connection name
+    if !name.is_empty()
+        && let Some(found) = quotas
+            .iter()
+            .find(|q| !q.name.is_empty() && q.name.trim().to_ascii_lowercase() == name)
+    {
+        return Some(found);
+    }
+
+    // 4. Single-quota fallback for primary profile when only one external quota entry exists
+    if profile.is_default_profile && quotas.len() == 1 {
+        return quotas.first();
+    }
+
+    None
+}
+
+/// Overlay exact server-side Antigravity quota percentages & reset timers onto a `ModelUsageBreakdown`.
+pub fn apply_server_quota_overlay(
+    models: &mut ModelUsageBreakdown,
+    quota: &ExternalAntigravityQuota,
+    now: DateTime<Utc>,
+) {
+    if !quota.ok {
+        return;
+    }
+    if let Some(b) = &quota.gemini_5h {
+        models.gemini_remaining_5h_pct = b.remaining_percent.clamp(0.0, 100.0);
+        if let Some(secs) = parse_reset_secs(&b.reset_at, now) {
+            models.gemini_reset_5h_secs = Some(secs);
+            models.gemini_reset_5h_label = format_reset_secs(Some(secs));
+        }
+    }
+    if let Some(b) = &quota.gemini_weekly {
+        models.gemini_remaining_7d_pct = b.remaining_percent.clamp(0.0, 100.0);
+    }
+    if let Some(b) = &quota.claude_gpt_5h {
+        models.claude_gpt_remaining_5h_pct = b.remaining_percent.clamp(0.0, 100.0);
+        if let Some(secs) = parse_reset_secs(&b.reset_at, now) {
+            models.claude_gpt_reset_5h_secs = Some(secs);
+            models.claude_gpt_reset_5h_label = format_reset_secs(Some(secs));
+        }
+    }
+    if let Some(b) = &quota.claude_gpt_weekly {
+        models.claude_gpt_remaining_7d_pct = b.remaining_percent.clamp(0.0, 100.0);
+    }
+}
+
+fn parse_reset_secs(iso: &str, now: DateTime<Utc>) -> Option<u64> {
+    let trimmed = iso.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let dt = DateTime::parse_from_rfc3339(trimmed).ok()?.with_timezone(&Utc);
+    if dt <= now {
+        return None;
+    }
+    u64::try_from((dt - now).num_seconds()).ok()
+}
+
+/// Return true if a matched server quota shows any 5h or weekly pool is effectively exhausted (`<= 1%`).
+pub fn is_server_quota_exhausted(quota: &ExternalAntigravityQuota) -> bool {
+    if !quota.ok {
+        return false;
+    }
+    [
+        quota.gemini_5h.as_ref(),
+        quota.gemini_weekly.as_ref(),
+        quota.claude_gpt_5h.as_ref(),
+        quota.claude_gpt_weekly.as_ref(),
+    ]
+    .into_iter()
+    .flatten()
+    .any(|b| b.remaining_percent <= 1.0)
+}
+
 #[cfg(test)]
 mod tests {
     use agswitch_primitives::{AccountId, AccountTier, RuleId, RuntimeOs};
@@ -1174,6 +1619,90 @@ mod tests {
             res,
             Err(AppError::PolicyBlocked { rule: RuleId::R1, .. })
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn external_telemetry_parses_matches_and_overlays_server_quotas() -> Result<(), String> {
+        let sample = r#"{
+            "meta": {"timestamp_bkk": "2026-11-25 14:00:00 +07"},
+            "maxplus": {
+                "credit_usd": 24.50,
+                "keys": [{"id": "k1"}, {"id": "k2"}],
+                "periods": {
+                    "24h": {"total_cost": 1.25},
+                    "7d": {"total_cost": 8.40}
+                }
+            },
+            "opencode_go": {
+                "ok": true,
+                "rolling": {"percent": 15.0},
+                "weekly": {"percent": 22.0},
+                "monthly": {"percent": 10.0},
+                "local_usage": {"combined": {"requests": 42}}
+            },
+            "tokenme": {
+                "cycle_elapsed_pct": 40.0,
+                "dec17_days": 20,
+                "combined_cycle": {"requests": 100, "total_tokens": 500000}
+            },
+            "firecrawl": {
+                "ok": true,
+                "remaining_credits": 450,
+                "plan_credits": 500,
+                "used_credits": 50,
+                "remaining_percent": 90.0
+            },
+            "burn_rate": {
+                "snapshot": {"burn_per_day": 2.0, "runway_days": 12.25}
+            },
+            "antigravity_quotas": [
+                {
+                    "name": "acc-alpha",
+                    "email": "alpha@example.com",
+                    "ok": true,
+                    "buckets": {
+                        "gemini_5h": {"remaining_percent": 72.5, "used_percent": 27.5, "reset_at": "2026-11-25T16:30:00Z"},
+                        "gemini_weekly": {"remaining_percent": 88.0, "used_percent": 12.0, "reset_at": ""},
+                        "claude_gpt_5h": {"remaining_percent": 0.5, "used_percent": 99.5, "reset_at": "2026-11-25T15:00:00Z"},
+                        "claude_gpt_weekly": {"remaining_percent": 65.0, "used_percent": 35.0, "reset_at": ""}
+                    }
+                }
+            ]
+        }"#;
+
+        assert!(parse_external_telemetry_json("{bad json", "test").is_none());
+        let parsed = parse_external_telemetry_json(sample, "localhost:8289")
+            .ok_or_else(|| "expected telemetry parse".to_owned())?;
+        assert!(parsed.connected);
+        assert_eq!(parsed.providers.len(), 4);
+        assert_eq!(parsed.antigravity_quotas.len(), 1);
+        assert_eq!(parsed.burn_per_day_usd, Some(2.0));
+        assert_eq!(parsed.runway_days, Some(12.25));
+
+        let profile = AccountProfile::create_isolated(
+            AccountId::new("alpha").map_err(|e| e.to_string())?,
+            "Alpha".to_owned(),
+            "alpha@example.com".to_owned(),
+            "#6FD8EE".to_owned(),
+            "/tmp/alpha".to_owned(),
+        );
+        let matched = match_external_quota(&profile, &parsed.antigravity_quotas)
+            .ok_or_else(|| "expected quota match".to_owned())?;
+        assert!(is_server_quota_exhausted(matched));
+
+        let now = Utc
+            .with_ymd_and_hms(2026, 11, 25, 14, 0, 0)
+            .single()
+            .ok_or_else(|| "invalid ts".to_owned())?;
+        let mut models = ModelUsageBreakdown::default();
+        apply_server_quota_overlay(&mut models, matched, now);
+        assert!((models.gemini_remaining_5h_pct - 72.5).abs() < 0.01);
+        assert!((models.gemini_remaining_7d_pct - 88.0).abs() < 0.01);
+        assert!((models.claude_gpt_remaining_5h_pct - 0.5).abs() < 0.01);
+        assert!((models.claude_gpt_remaining_7d_pct - 65.0).abs() < 0.01);
+        assert_eq!(models.gemini_reset_5h_secs, Some(9_000));
+        assert_eq!(models.claude_gpt_reset_5h_secs, Some(3_600));
         Ok(())
     }
 }

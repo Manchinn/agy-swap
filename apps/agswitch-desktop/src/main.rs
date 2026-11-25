@@ -11,11 +11,12 @@ use std::rc::Rc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agswitch_engine::{Engine, EngineDefaults, ProcessPort, TranscriptPort};
+use agswitch_engine::{Engine, EngineDefaults, ProcessPort, TelemetryFeedPort, TranscriptPort};
 use agswitch_integrations::{
-    OsProcessAdapter, OsTranscriptAdapter, OsWorkspaceLinkAdapter, SystemClockAdapter,
-    default_antigravity_bin_path, default_data_dir, default_profiles_root_dir,
-    open_directory_in_file_manager, primary_home_dir, sandbox,
+    LocalTelemetryBridgeAdapter, OsProcessAdapter, OsTranscriptAdapter, OsWorkspaceLinkAdapter,
+    SystemClockAdapter, default_antigravity_bin_path, default_data_dir, default_profiles_root_dir,
+    default_telemetry_base_url, open_directory_in_file_manager, open_local_url, primary_home_dir,
+    sandbox,
 };
 use agswitch_primitives::RuntimeOs;
 use agswitch_spec::{CallerContext, CommandRequest, CommandResponse, DashboardSnapshot};
@@ -76,35 +77,42 @@ fn main() -> ExitCode {
             paths.running_state_file,
         ));
         let tx_adapter: Arc<dyn TranscriptPort> = Arc::new(sandbox::SandboxTranscriptAdapter);
-        let engine = Arc::new(Engine::new(
-            EngineDefaults {
-                profiles_root_dir: paths.profiles_root.to_string_lossy().into_owned(),
-                antigravity_bin_path: "/sandbox/Antigravity".to_owned(),
-                runtime_os: RuntimeOs::current(),
-            },
-            Arc::new(JsonFileStore::new(paths.data_dir.clone())),
-            proc_adapter,
-            Arc::new(OsWorkspaceLinkAdapter::new(paths.fake_home)),
-            tx_adapter,
-            Arc::new(SystemClockAdapter),
-        ));
+        let tel_adapter: Arc<dyn TelemetryFeedPort> = Arc::new(sandbox::SandboxTelemetryAdapter);
+        let engine = Arc::new(
+            Engine::new(
+                EngineDefaults {
+                    profiles_root_dir: paths.profiles_root.to_string_lossy().into_owned(),
+                    antigravity_bin_path: "/sandbox/Antigravity".to_owned(),
+                    runtime_os: RuntimeOs::current(),
+                },
+                Arc::new(JsonFileStore::new(paths.data_dir.clone())),
+                proc_adapter,
+                Arc::new(OsWorkspaceLinkAdapter::new(paths.fake_home)),
+                tx_adapter,
+                Arc::new(SystemClockAdapter),
+            )
+            .with_telemetry(tel_adapter),
+        );
         (paths.data_dir, paths.profiles_root, engine)
     } else {
         let data_dir = default_data_dir();
         let profiles_root = default_profiles_root_dir(&data_dir);
         let primary_home = primary_home_dir();
-        let engine = Arc::new(Engine::new(
-            EngineDefaults {
-                profiles_root_dir: profiles_root.to_string_lossy().into_owned(),
-                antigravity_bin_path: default_antigravity_bin_path(),
-                runtime_os: RuntimeOs::current(),
-            },
-            Arc::new(JsonFileStore::new(data_dir.clone())),
-            Arc::new(OsProcessAdapter::new()),
-            Arc::new(OsWorkspaceLinkAdapter::new(primary_home.clone())),
-            Arc::new(OsTranscriptAdapter::new(primary_home)),
-            Arc::new(SystemClockAdapter),
-        ));
+        let engine = Arc::new(
+            Engine::new(
+                EngineDefaults {
+                    profiles_root_dir: profiles_root.to_string_lossy().into_owned(),
+                    antigravity_bin_path: default_antigravity_bin_path(),
+                    runtime_os: RuntimeOs::current(),
+                },
+                Arc::new(JsonFileStore::new(data_dir.clone())),
+                Arc::new(OsProcessAdapter::new()),
+                Arc::new(OsWorkspaceLinkAdapter::new(primary_home.clone())),
+                Arc::new(OsTranscriptAdapter::new(primary_home)),
+                Arc::new(SystemClockAdapter),
+            )
+            .with_telemetry(Arc::new(LocalTelemetryBridgeAdapter::from_defaults())),
+        );
         (data_dir, profiles_root, engine)
     };
 
@@ -231,6 +239,18 @@ fn main() -> ExitCode {
                                     ));
                                 })
                                 .await;
+                        }
+                        TrayAction::OpenUsageConsole => {
+                            let base = default_telemetry_base_url();
+                            let url = format!("{base}/opendesign/mockups/ai-usage-tracker/index.html");
+                            let _ = open_local_url(&url);
+                        }
+                        TrayAction::OpenMiniHud => {
+                            let base = default_telemetry_base_url();
+                            let url = format!(
+                                "{base}/opendesign/mockups/ai-usage-tracker/widget.html?mode=mini"
+                            );
+                            let _ = open_local_url(&url);
                         }
                         TrayAction::OpenProfilesFolder => {
                             let _ =

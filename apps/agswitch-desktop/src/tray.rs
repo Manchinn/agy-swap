@@ -4,6 +4,8 @@ use tray_icon::{Icon, MouseButton, MouseButtonState, Rect, TrayIcon, TrayIconBui
 
 pub const MENU_TOGGLE_PANEL: &str = "agswitch.toggle_panel";
 pub const MENU_SWITCH_NEXT: &str = "agswitch.switch_next";
+pub const MENU_OPEN_CONSOLE: &str = "agswitch.open_console";
+pub const MENU_OPEN_MINI_HUD: &str = "agswitch.open_mini_hud";
 pub const MENU_OPEN_FOLDER: &str = "agswitch.open_folder";
 pub const MENU_QUIT: &str = "agswitch.quit";
 pub const MENU_ACCOUNT_PREFIX: &str = "agswitch.acc.";
@@ -33,6 +35,8 @@ pub enum TrayAction {
     TogglePanel(Option<TrayAnchorRect>),
     SwitchNext,
     SwitchAccount(String),
+    OpenUsageConsole,
+    OpenMiniHud,
     OpenProfilesFolder,
     Quit,
 }
@@ -141,6 +145,10 @@ impl TrayController {
                 actions.push(TrayAction::TogglePanel(self.anchor_rect()));
             } else if id == MENU_SWITCH_NEXT {
                 actions.push(TrayAction::SwitchNext);
+            } else if id == MENU_OPEN_CONSOLE {
+                actions.push(TrayAction::OpenUsageConsole);
+            } else if id == MENU_OPEN_MINI_HUD {
+                actions.push(TrayAction::OpenMiniHud);
             } else if id == MENU_OPEN_FOLDER {
                 actions.push(TrayAction::OpenProfilesFolder);
             } else if id == MENU_QUIT {
@@ -201,6 +209,18 @@ fn build_menu(snap: Option<&DashboardSnapshot>) -> Menu {
         true,
         None,
     );
+    let item_console = MenuItem::with_id(
+        MenuId::new(MENU_OPEN_CONSOLE),
+        "Open Usage Console ↗",
+        true,
+        None,
+    );
+    let item_mini_hud = MenuItem::with_id(
+        MenuId::new(MENU_OPEN_MINI_HUD),
+        "Open Mini HUD Strip ↗",
+        true,
+        None,
+    );
     let item_folder = MenuItem::with_id(
         MenuId::new(MENU_OPEN_FOLDER),
         "Open Profiles Folder",
@@ -210,6 +230,8 @@ fn build_menu(snap: Option<&DashboardSnapshot>) -> Menu {
     let item_quit = MenuItem::with_id(MenuId::new(MENU_QUIT), "Quit AGY Swap", true, None);
 
     let _ = menu.append(&item_toggle);
+    let _ = menu.append(&item_console);
+    let _ = menu.append(&item_mini_hud);
     let _ = menu.append(&item_folder);
     let _ = menu.append(&PredefinedMenuItem::separator());
     let _ = menu.append(&item_quit);

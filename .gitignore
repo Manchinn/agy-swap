@@ -3,3 +3,10 @@
 **/*.rs.bk
 .DS_Store
 Thumbs.db
+.env
+.env.*
+*.sqlite
+*.sqlite3
+*.db
+usage-data.json
+usage_snapshots.jsonl

@@ -10,8 +10,8 @@ pub use agswitch_spec as spec;
 use agswitch_spec::{
     AccessPolicy, AccountProfile, AccountView, AddAccountInput, AuditEntry, AuditOutcome,
     CallerContext, CommandId, CommandRequest, CommandResponse, DashboardSnapshot,
-    DeleteAccountInput, LaunchSpec, RunningInstance, SwitcherConfig, TranscriptFeed,
-    UpdateAccountInput,
+    DeleteAccountInput, ExternalTelemetrySnapshot, LaunchSpec, RunningInstance, SwitcherConfig,
+    TranscriptFeed, UpdateAccountInput,
 };
 use agswitch_store::StateStore;
 use chrono::{DateTime, Utc};
@@ -55,6 +55,22 @@ pub trait ClockPort: Send + Sync {
     fn now_utc(&self) -> DateTime<Utc>;
 }
 
+/// Optional read-only local telemetry bridge port (e.g. `ai-usage-tracker` on localhost).
+/// Never handles OAuth tokens directly (Rule R2 preserved in `agswitch-engine`).
+pub trait TelemetryFeedPort: Send + Sync {
+    fn load_external_telemetry(&self, force_fresh: bool) -> Option<ExternalTelemetrySnapshot>;
+}
+
+/// Default no-op telemetry bridge when external telemetry is disabled or not wired.
+#[derive(Debug, Default)]
+pub struct NoopTelemetryFeedAdapter;
+
+impl TelemetryFeedPort for NoopTelemetryFeedAdapter {
+    fn load_external_telemetry(&self, _force_fresh: bool) -> Option<ExternalTelemetrySnapshot> {
+        None
+    }
+}
+
 /// Default-deny registry mapping every allowed `CommandId` to its `AccessPolicy` (Rule R5).
 #[derive(Debug, Clone)]
 pub struct CommandRegistry {
@@ -77,6 +93,7 @@ impl CommandRegistry {
         policies.insert(CommandId::SetSharedChats, AccessPolicy::LocalUser);
         policies.insert(CommandId::ResetLogin, AccessPolicy::DestructiveLocalUser);
         policies.insert(CommandId::ListAudit, AccessPolicy::LocalUser);
+        policies.insert(CommandId::RefreshTelemetry, AccessPolicy::LocalUser);
         Self { policies }
     }
 
@@ -148,6 +165,7 @@ pub struct Engine {
     workspace: Arc<dyn WorkspaceLinkPort>,
     transcripts: Arc<dyn TranscriptPort>,
     clock: Arc<dyn ClockPort>,
+    telemetry: Arc<dyn TelemetryFeedPort>,
 }
 
 impl Engine {
@@ -187,7 +205,15 @@ impl Engine {
             workspace,
             transcripts,
             clock,
+            telemetry: Arc::new(NoopTelemetryFeedAdapter),
         }
+    }
+
+    /// Attach an optional local telemetry bridge adapter (e.g. HTTP/file reader for `ai-usage-tracker`).
+    #[must_use]
+    pub fn with_telemetry(mut self, telemetry: Arc<dyn TelemetryFeedPort>) -> Self {
+        self.telemetry = telemetry;
+        self
     }
 
     /// Fixed execution pipeline: policy check -> panic boundary -> handler -> centralized audit trail.
@@ -250,8 +276,18 @@ impl Engine {
     ) -> Result<(CommandResponse, Option<String>), AppError> {
         match request {
             CommandRequest::GetDashboard => {
-                let snap = self.build_dashboard(now)?;
+                let snap = self.build_dashboard(now, false)?;
                 Ok((CommandResponse::Dashboard(snap), None))
+            }
+            CommandRequest::RefreshTelemetry => {
+                let snap = self.build_dashboard(now, true)?;
+                let src = snap
+                    .external_telemetry
+                    .as_ref()
+                    .filter(|t| t.connected)
+                    .map_or("offline", |t| t.source_label.as_str());
+                let summary = format!("Refreshed external telemetry ({src})");
+                Ok((CommandResponse::Dashboard(snap), Some(summary)))
             }
             CommandRequest::ListAudit { limit } => {
                 let entries = self.store.load_recent_audits(limit.clamp(1, 200))?;
@@ -262,7 +298,18 @@ impl Engine {
                 let running_map = self.running_pids_by_profile(&cfg)?;
                 let running_ids: BTreeSet<String> = running_map.keys().cloned().collect();
                 let ledger = self.store.load_ledger()?;
-                let cooldown_ids = domain::active_cooldown_ids(&ledger, now);
+                let mut cooldown_ids = domain::active_cooldown_ids(&ledger, now);
+                if let Some(ext) = self.telemetry.load_external_telemetry(false)
+                    && ext.connected
+                {
+                    for p in &cfg.profiles {
+                        if let Some(q) = domain::match_external_quota(p, &ext.antigravity_quotas)
+                            && domain::is_server_quota_exhausted(q)
+                        {
+                            cooldown_ids.insert(p.id.as_str().to_owned());
+                        }
+                    }
+                }
                 let next = domain::choose_next_profile(
                     &cfg.profiles,
                     &running_ids,
@@ -467,7 +514,11 @@ impl Engine {
         Ok(map)
     }
 
-    fn build_dashboard(&self, now: DateTime<Utc>) -> Result<DashboardSnapshot, AppError> {
+    fn build_dashboard(
+        &self,
+        now: DateTime<Utc>,
+        force_fresh_telemetry: bool,
+    ) -> Result<DashboardSnapshot, AppError> {
         let cfg = self.load_or_init_config()?;
         let running_map = self.running_pids_by_profile(&cfg)?;
         let active_ids: Vec<String> = running_map
@@ -486,7 +537,19 @@ impl Engine {
             .load_recent_feeds(&cfg.profiles, now)
             .unwrap_or_default();
         let usage = domain::compute_usage_snapshot(&cfg.profiles, &ledger, &feeds, now);
-        let cooldown_ids = domain::active_cooldown_ids(&ledger, now);
+        let external_telemetry = self.telemetry.load_external_telemetry(force_fresh_telemetry);
+        let mut cooldown_ids = domain::active_cooldown_ids(&ledger, now);
+        if let Some(ext) = &external_telemetry
+            && ext.connected
+        {
+            for p in &cfg.profiles {
+                if let Some(q) = domain::match_external_quota(p, &ext.antigravity_quotas)
+                    && domain::is_server_quota_exhausted(q)
+                {
+                    cooldown_ids.insert(p.id.as_str().to_owned());
+                }
+            }
+        }
         let running_set: BTreeSet<String> = active_ids.into_iter().collect();
 
         let next_profile = domain::choose_next_profile(
@@ -518,7 +581,26 @@ impl Engine {
             let is_shared_chats = self.workspace.is_shared_mode_enabled(p);
             let metrics = usage.by_profile_id.get(p.id.as_str());
             let tier = metrics.map_or(domain::resolve_tier(p, &ledger), |m| m.tier);
-            let reset_label = domain::format_reset_secs(metrics.and_then(|m| m.reset_in_secs));
+            let mut models = metrics.map_or_else(
+                agswitch_spec::ModelUsageBreakdown::default,
+                |m| m.models.clone(),
+            );
+            let server_quota = external_telemetry
+                .as_ref()
+                .filter(|t| t.connected)
+                .and_then(|t| domain::match_external_quota(p, &t.antigravity_quotas))
+                .cloned();
+            let server_exhausted = server_quota
+                .as_ref()
+                .is_some_and(domain::is_server_quota_exhausted);
+            if let Some(sq) = &server_quota {
+                domain::apply_server_quota_overlay(&mut models, sq, now);
+            }
+            let effective_reset_secs = metrics
+                .and_then(|m| m.reset_in_secs)
+                .or(models.gemini_reset_5h_secs)
+                .or(models.claude_gpt_reset_5h_secs);
+            let reset_label = domain::format_reset_secs(effective_reset_secs);
 
             accounts.push(AccountView {
                 id: p.id.as_str().to_owned(),
@@ -544,13 +626,11 @@ impl Engine {
                 tokens_7d: metrics.map_or(0, |m| m.tokens_7d),
                 load_percent_5h: metrics.map_or(0.0, |m| m.load_percent_5h),
                 load_percent_7d: metrics.map_or(0.0, |m| m.load_percent_7d),
-                models: metrics.map_or_else(
-                    agswitch_spec::ModelUsageBreakdown::default,
-                    |m| m.models.clone(),
-                ),
-                is_on_cooldown: metrics.is_some_and(|m| m.is_on_cooldown),
-                reset_in_secs: metrics.and_then(|m| m.reset_in_secs),
+                models,
+                is_on_cooldown: metrics.is_some_and(|m| m.is_on_cooldown) || server_exhausted,
+                reset_in_secs: effective_reset_secs,
                 reset_label,
+                server_quota,
             });
         }
 
@@ -574,6 +654,7 @@ impl Engine {
             models_7d: usage.models_7d,
             accounts,
             rules: domain::enforced_rules_status(),
+            external_telemetry,
         })
     }
 
@@ -1394,6 +1475,94 @@ mod engine_tests {
             } => {
                 assert_eq!(target_id, "backup");
                 assert_eq!(closed_count, 1);
+            }
+            other => return Err(format!("unexpected response: {other:?}")),
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn switch_next_skips_server_quota_exhausted_account() -> Result<(), String> {
+        struct FakeTelemetry(ExternalTelemetrySnapshot);
+        impl TelemetryFeedPort for FakeTelemetry {
+            fn load_external_telemetry(&self, _force_fresh: bool) -> Option<ExternalTelemetrySnapshot> {
+                Some(self.0.clone())
+            }
+        }
+
+        let proc = Arc::new(FakeProcess::new());
+        if let Ok(mut r) = proc.running.lock() {
+            r.push(RunningInstance {
+                pid: 77,
+                user_data_dir: None,
+                command_line: "/Applications/Antigravity.app/Contents/MacOS/Antigravity".to_owned(),
+            });
+        }
+        let ws = Arc::new(FakeWorkspace::new());
+        let (base_engine, _store) =
+            make_engine(proc.clone(), ws, CommandRegistry::default_switcher_registry())?;
+
+        let ext = ExternalTelemetrySnapshot {
+            connected: true,
+            source_label: "mock-bridge".to_owned(),
+            updated_at: "2026-11-25 14:00:00".to_owned(),
+            burn_per_day_usd: Some(1.5),
+            runway_days: Some(10.0),
+            antigravity_quotas: vec![agswitch_spec::ExternalAntigravityQuota {
+                name: "work".to_owned(),
+                email: "work@example.com".to_owned(),
+                ok: true,
+                gemini_5h: Some(agswitch_spec::ServerQuotaBucket {
+                    remaining_percent: 0.0,
+                    used_percent: 100.0,
+                    reset_at: String::new(),
+                }),
+                gemini_weekly: None,
+                claude_gpt_5h: None,
+                claude_gpt_weekly: None,
+            }],
+            providers: Vec::new(),
+        };
+        let engine = base_engine.with_telemetry(Arc::new(FakeTelemetry(ext)));
+
+        for (name, sub) in [("Work", "work@example.com"), ("Backup", "backup@example.com")] {
+            let _ = engine
+                .execute(
+                    CommandRequest::AddAccount(AddAccountInput {
+                        display_name: name.to_owned(),
+                        subtitle: sub.to_owned(),
+                        accent_hex: None,
+                        tier_override: None,
+                        share_chats_and_skills: true,
+                        open_and_sign_in: false,
+                    }),
+                    CallerContext::local_interactive(),
+                )
+                .await
+                .map_err(|e| e.to_string())?;
+        }
+
+        let res = engine
+            .execute(CommandRequest::SwitchNext, CallerContext::local_interactive())
+            .await
+            .map_err(|e| e.to_string())?;
+        match res {
+            CommandResponse::Switched { target_id, .. } => {
+                assert_eq!(target_id, "backup");
+            }
+            other => return Err(format!("unexpected response: {other:?}")),
+        }
+
+        let refreshed = engine
+            .execute(
+                CommandRequest::RefreshTelemetry,
+                CallerContext::local_interactive(),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        match refreshed {
+            CommandResponse::Dashboard(snap) => {
+                assert!(snap.external_telemetry.is_some_and(|t| t.connected));
             }
             other => return Err(format!("unexpected response: {other:?}")),
         }
