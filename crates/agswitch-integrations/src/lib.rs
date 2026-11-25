@@ -1481,7 +1481,9 @@ pub mod sandbox {
         fn load_external_telemetry(&self, _force_fresh: bool) -> Option<ExternalTelemetrySnapshot> {
             let now = Utc::now();
             let g_reset = (now + Duration::minutes(164)).to_rfc3339();
+            let g_wk_reset = (now + Duration::hours(138)).to_rfc3339();
             let cg_reset = (now + Duration::minutes(118)).to_rfc3339();
+            let cg_wk_reset = (now + Duration::hours(164)).to_rfc3339();
             Some(ExternalTelemetrySnapshot {
                 connected: true,
                 source_label: "sandbox-bridge".to_owned(),
@@ -1499,9 +1501,9 @@ pub mod sandbox {
                             reset_at: g_reset.clone(),
                         }),
                         gemini_weekly: Some(ServerQuotaBucket {
-                            remaining_percent: 91.5,
-                            used_percent: 8.5,
-                            reset_at: String::new(),
+                            remaining_percent: 73.0,
+                            used_percent: 27.0,
+                            reset_at: g_wk_reset.clone(),
                         }),
                         claude_gpt_5h: Some(ServerQuotaBucket {
                             remaining_percent: 64.0,
@@ -1511,7 +1513,7 @@ pub mod sandbox {
                         claude_gpt_weekly: Some(ServerQuotaBucket {
                             remaining_percent: 78.0,
                             used_percent: 22.0,
-                            reset_at: String::new(),
+                            reset_at: cg_wk_reset.clone(),
                         }),
                     },
                     ExternalAntigravityQuota {
@@ -1526,7 +1528,7 @@ pub mod sandbox {
                         gemini_weekly: Some(ServerQuotaBucket {
                             remaining_percent: 96.0,
                             used_percent: 4.0,
-                            reset_at: String::new(),
+                            reset_at: g_wk_reset,
                         }),
                         claude_gpt_5h: Some(ServerQuotaBucket {
                             remaining_percent: 85.0,
@@ -1536,7 +1538,7 @@ pub mod sandbox {
                         claude_gpt_weekly: Some(ServerQuotaBucket {
                             remaining_percent: 88.0,
                             used_percent: 12.0,
-                            reset_at: String::new(),
+                            reset_at: cg_wk_reset,
                         }),
                     },
                 ],

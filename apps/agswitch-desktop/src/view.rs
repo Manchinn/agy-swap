@@ -4,7 +4,9 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use agswitch_domain::{format_clock_hm, format_tokens, is_child_process};
+use agswitch_domain::{
+    format_clock_hm, format_reset_countdown_from_iso, format_tokens, is_child_process,
+};
 use agswitch_engine::Engine;
 use agswitch_integrations::{
     default_telemetry_base_url, open_directory_in_file_manager, open_local_url,
@@ -14,6 +16,7 @@ use agswitch_spec::{
     AccountView, AddAccountInput, AuditEntry, AuditOutcome, CallerContext, CommandRequest,
     CommandResponse, DashboardSnapshot, DeleteAccountInput, SingleModelUsage, UpdateAccountInput,
 };
+use chrono::Utc;
 use gpui::{
     AnyElement, Context, FocusHandle, Focusable, Hsla, InteractiveElement, IntoElement,
     KeyDownEvent, ParentElement, Render, SharedString, StatefulInteractiveElement, Styled, Window,
@@ -1258,55 +1261,58 @@ impl AgSwitchView {
             .render_matrix("split-orb", LedSpec::hero_7x7(orb_mode, orb_theme, 0.0));
 
         let is_sel_cd = selected_acc.as_ref().is_some_and(|a| a.is_on_cooldown);
-        let has_server_quota = selected_acc
+        let server_quota = selected_acc
             .as_ref()
             .and_then(|a| a.server_quota.as_ref())
-            .is_some_and(|sq| sq.ok);
+            .filter(|sq| sq.ok);
+        let has_server_quota = server_quota.is_some();
         let models = selected_acc
             .as_ref()
             .map(|a| a.models.clone())
             .unwrap_or_else(|| snap.models_7d.clone());
+        let now_utc = Utc::now();
 
         let g_secs = models.gemini_reset_5h_secs;
         let cg_secs = models.claude_gpt_reset_5h_secs;
         let g_clock = format_clock_hm(g_secs);
         let cg_clock = format_clock_hm(cg_secs);
 
-        let g_theme = if has_server_quota && models.gemini_remaining_5h_pct <= 15.0 {
-            PhosphorTheme::Amber
+        let g_theme = if has_server_quota {
+            server_pct_theme(models.gemini_remaining_5h_pct, PhosphorTheme::Cyan)
         } else {
             timer_bar_theme(g_secs, is_sel_cd, PhosphorTheme::Cyan)
         };
-        let cg_theme = if has_server_quota && models.claude_gpt_remaining_5h_pct <= 15.0 {
-            PhosphorTheme::Amber
+        let cg_theme = if has_server_quota {
+            server_pct_theme(models.claude_gpt_remaining_5h_pct, PhosphorTheme::Emerald)
         } else {
             timer_bar_theme(cg_secs, is_sel_cd, PhosphorTheme::Emerald)
         };
 
         let g_digits = dot_matrix_readout(&g_clock, 1.7, 0.6, p.digit_lit, p.digit_unlit);
         let cg_digits = dot_matrix_readout(&cg_clock, 1.7, 0.6, p.digit_lit, p.digit_unlit);
-        let g_fraction = if has_server_quota {
-            percent_to_f32_fraction(models.gemini_remaining_5h_pct)
-        } else {
-            window_5h_fraction(g_secs)
-        };
-        let cg_fraction = if has_server_quota {
-            percent_to_f32_fraction(models.claude_gpt_remaining_5h_pct)
-        } else {
-            window_5h_fraction(cg_secs)
-        };
-        let g_bar = segmented_led_bar(18, g_fraction, g_theme, p.led_unlit, 15.0, 5.5, 3.0);
-        let cg_bar = segmented_led_bar(18, cg_fraction, cg_theme, p.led_unlit, 15.0, 5.5, 3.0);
+        let g_bar = segmented_led_bar(
+            18,
+            window_5h_fraction(g_secs),
+            g_theme,
+            p.led_unlit,
+            15.0,
+            5.5,
+            3.0,
+        );
+        let cg_bar = segmented_led_bar(
+            18,
+            window_5h_fraction(cg_secs),
+            cg_theme,
+            p.led_unlit,
+            15.0,
+            5.5,
+            3.0,
+        );
 
         let g_unit = timer_unit_label(g_secs, is_sel_cd);
         let cg_unit = timer_unit_label(cg_secs, is_sel_cd);
 
-        let g_sub_left = if has_server_quota {
-            format!(
-                "5h: {:.0}% left · Wk: {:.0}%",
-                models.gemini_remaining_5h_pct, models.gemini_remaining_7d_pct
-            )
-        } else if models.gemini_calls_5h > 0 {
+        let g_sub_left = if models.gemini_calls_5h > 0 {
             format!("5h: {} calls", models.gemini_calls_5h)
         } else {
             "5h: 0 calls · ready".to_owned()
@@ -1318,12 +1324,7 @@ impl AgSwitchView {
         );
 
         let cg_calls_5h = models.claude_calls_5h.saturating_add(models.gpt_calls_5h);
-        let cg_sub_left = if has_server_quota {
-            format!(
-                "5h: {:.0}% left · Wk: {:.0}%",
-                models.claude_gpt_remaining_5h_pct, models.claude_gpt_remaining_7d_pct
-            )
-        } else if cg_calls_5h > 0 {
+        let cg_sub_left = if cg_calls_5h > 0 {
             format!("5h: {cg_calls_5h} calls")
         } else {
             "5h: 0 calls · ready".to_owned()
@@ -1332,6 +1333,273 @@ impl AgSwitchView {
             "7d: C:{}x · GPT:{}x",
             models.claude_calls_7d, models.gpt_calls_7d
         );
+
+        let g_5h_reset_str = server_quota
+            .and_then(|sq| sq.gemini_5h.as_ref())
+            .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+        let g_wk_reset_str = server_quota
+            .and_then(|sq| sq.gemini_weekly.as_ref())
+            .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+        let cg_5h_reset_str = server_quota
+            .and_then(|sq| sq.claude_gpt_5h.as_ref())
+            .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+        let cg_wk_reset_str = server_quota
+            .and_then(|sq| sq.claude_gpt_weekly.as_ref())
+            .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+
+        let gemini_pool_body: AnyElement = if has_server_quota {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .rounded(px(2.0))
+                                        .bg(g_theme.accent()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(p.text_primary)
+                                        .child("GEMINI MODELS"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(px(9.5))
+                                .text_color(p.text_muted)
+                                .child(g_sub_right.clone()),
+                        ),
+                )
+                .child(render_server_quota_bar_row(
+                    "5H LIMIT",
+                    models.gemini_remaining_5h_pct,
+                    g_5h_reset_str,
+                    server_pct_theme(models.gemini_remaining_5h_pct, PhosphorTheme::Cyan),
+                    18,
+                    9.0,
+                    p,
+                ))
+                .child(render_server_quota_bar_row(
+                    "WEEKLY",
+                    models.gemini_remaining_7d_pct,
+                    g_wk_reset_str,
+                    server_pct_theme(models.gemini_remaining_7d_pct, PhosphorTheme::Cyan),
+                    18,
+                    9.0,
+                    p,
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_end()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .rounded(px(2.0))
+                                        .bg(g_theme.accent()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(p.text_primary)
+                                        .child("GEMINI MODELS"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_end()
+                                .gap(px(4.0))
+                                .child(g_digits)
+                                .child(
+                                    div()
+                                        .text_size(px(9.0))
+                                        .text_color(p.text_muted)
+                                        .child(g_unit),
+                                ),
+                        ),
+                )
+                .child(g_bar)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .text_size(px(9.5))
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(p.text_secondary)
+                                .child(g_sub_left),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(p.text_muted)
+                                .child(g_sub_right),
+                        ),
+                )
+                .into_any_element()
+        };
+
+        let claude_gpt_pool_body: AnyElement = if has_server_quota {
+            div()
+                .pt(px(8.0))
+                .border_t_1()
+                .border_color(p.border_subtle)
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .rounded(px(2.0))
+                                        .bg(cg_theme.accent()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(p.text_primary)
+                                        .child("CLAUDE & GPT"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(px(9.5))
+                                .text_color(p.text_muted)
+                                .child(cg_sub_right.clone()),
+                        ),
+                )
+                .child(render_server_quota_bar_row(
+                    "5H LIMIT",
+                    models.claude_gpt_remaining_5h_pct,
+                    cg_5h_reset_str,
+                    server_pct_theme(models.claude_gpt_remaining_5h_pct, PhosphorTheme::Emerald),
+                    18,
+                    9.0,
+                    p,
+                ))
+                .child(render_server_quota_bar_row(
+                    "WEEKLY",
+                    models.claude_gpt_remaining_7d_pct,
+                    cg_wk_reset_str,
+                    server_pct_theme(models.claude_gpt_remaining_7d_pct, PhosphorTheme::Emerald),
+                    18,
+                    9.0,
+                    p,
+                ))
+                .into_any_element()
+        } else {
+            div()
+                .pt(px(9.0))
+                .border_t_1()
+                .border_color(p.border_subtle)
+                .flex()
+                .flex_col()
+                .gap(px(5.0))
+                .child(
+                    div()
+                        .flex()
+                        .items_end()
+                        .justify_between()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap(px(6.0))
+                                .child(
+                                    div()
+                                        .w(px(6.0))
+                                        .h(px(6.0))
+                                        .rounded(px(2.0))
+                                        .bg(cg_theme.accent()),
+                                )
+                                .child(
+                                    div()
+                                        .text_size(px(10.5))
+                                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                                        .text_color(p.text_primary)
+                                        .child("CLAUDE & GPT"),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_end()
+                                .gap(px(4.0))
+                                .child(cg_digits)
+                                .child(
+                                    div()
+                                        .text_size(px(9.0))
+                                        .text_color(p.text_muted)
+                                        .child(cg_unit),
+                                ),
+                        ),
+                )
+                .child(cg_bar)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .justify_between()
+                        .text_size(px(9.5))
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(p.text_secondary)
+                                .child(cg_sub_left),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_color(p.text_muted)
+                                .child(cg_sub_right),
+                        ),
+                )
+                .into_any_element()
+        };
 
         let profiles_dir = snap.profiles_root_dir.clone();
 
@@ -1565,141 +1833,10 @@ impl AgSwitchView {
                             .child("Models ›"),
                     ),
             )
-            // Pool 1: GEMINI MODELS (5h local timer + exact calls/tokens)
-            .child(
-                div()
-                    .flex()
-                    .flex_col()
-                    .gap(px(5.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_end()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .w(px(6.0))
-                                            .h(px(6.0))
-                                            .rounded(px(2.0))
-                                            .bg(g_theme.accent()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.5))
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(p.text_primary)
-                                            .child("GEMINI MODELS"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_end()
-                                    .gap(px(4.0))
-                                    .child(g_digits)
-                                    .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .text_color(p.text_muted)
-                                            .child(g_unit),
-                                    ),
-                            ),
-                    )
-                    .child(g_bar)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .text_size(px(9.5))
-                            .child(
-                                div()
-                                    .whitespace_nowrap()
-                                    .text_color(p.text_secondary)
-                                    .child(g_sub_left),
-                            )
-                            .child(
-                                div()
-                                    .whitespace_nowrap()
-                                    .text_color(p.text_muted)
-                                    .child(g_sub_right),
-                            ),
-                    ),
-            )
-            // Pool 2: CLAUDE & GPT MODELS (5h local timer + exact calls/tokens)
-            .child(
-                div()
-                    .pt(px(9.0))
-                    .border_t_1()
-                    .border_color(p.border_subtle)
-                    .flex()
-                    .flex_col()
-                    .gap(px(5.0))
-                    .child(
-                        div()
-                            .flex()
-                            .items_end()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_center()
-                                    .gap(px(6.0))
-                                    .child(
-                                        div()
-                                            .w(px(6.0))
-                                            .h(px(6.0))
-                                            .rounded(px(2.0))
-                                            .bg(cg_theme.accent()),
-                                    )
-                                    .child(
-                                        div()
-                                            .text_size(px(10.5))
-                                            .font_weight(gpui::FontWeight::SEMIBOLD)
-                                            .text_color(p.text_primary)
-                                            .child("CLAUDE & GPT"),
-                                    ),
-                            )
-                            .child(
-                                div()
-                                    .flex()
-                                    .items_end()
-                                    .gap(px(4.0))
-                                    .child(cg_digits)
-                                    .child(
-                                        div()
-                                            .text_size(px(9.0))
-                                            .text_color(p.text_muted)
-                                            .child(cg_unit),
-                                    ),
-                            ),
-                    )
-                    .child(cg_bar)
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .text_size(px(9.5))
-                            .child(
-                                div()
-                                    .whitespace_nowrap()
-                                    .text_color(p.text_secondary)
-                                    .child(cg_sub_left),
-                            )
-                            .child(
-                                div()
-                                    .whitespace_nowrap()
-                                    .text_color(p.text_muted)
-                                    .child(cg_sub_right),
-                            ),
-                    ),
-            )
+            // Pool 1: GEMINI MODELS (dual 5H+WK live server bars OR local 5h timer)
+            .child(gemini_pool_body)
+            // Pool 2: CLAUDE & GPT MODELS (dual 5H+WK live server bars OR local 5h timer)
+            .child(claude_gpt_pool_body)
             // Context + Cache hairline footer
             .child(
                 div()
@@ -2384,6 +2521,8 @@ impl AgSwitchView {
         };
 
         let m = &acc.models;
+        let sq = acc.server_quota.as_ref().filter(|q| q.ok);
+        let now_utc = Utc::now();
         let g_secs = m.gemini_reset_5h_secs;
         let cg_secs = m.claude_gpt_reset_5h_secs;
         let g_clock = format_clock_hm(g_secs);
@@ -2394,6 +2533,110 @@ impl AgSwitchView {
         let cg_5h_calls = m.claude_calls_5h.saturating_add(m.gpt_calls_5h);
         let cg_7d_calls = m.claude_calls_7d.saturating_add(m.gpt_calls_7d);
         let cg_7d_tok = m.claude_tokens_7d.saturating_add(m.gpt_tokens_7d);
+
+        let g_detail_meter: AnyElement = if let Some(q) = sq {
+            let g5_reset = q
+                .gemini_5h
+                .as_ref()
+                .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+            let gwk_reset = q
+                .gemini_weekly
+                .as_ref()
+                .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(render_server_quota_bar_row(
+                    "5-HOUR LIMIT",
+                    m.gemini_remaining_5h_pct,
+                    g5_reset,
+                    server_pct_theme(m.gemini_remaining_5h_pct, PhosphorTheme::Cyan),
+                    16,
+                    13.0,
+                    p,
+                ))
+                .child(render_server_quota_bar_row(
+                    "WEEKLY LIMIT",
+                    m.gemini_remaining_7d_pct,
+                    gwk_reset,
+                    server_pct_theme(m.gemini_remaining_7d_pct, PhosphorTheme::Cyan),
+                    16,
+                    13.0,
+                    p,
+                ))
+                .into_any_element()
+        } else {
+            render_timer_pool_row(
+                "5-HOUR ROLLING TIMER",
+                &g_clock,
+                timer_unit_label(g_secs, acc.is_on_cooldown),
+                window_5h_fraction(g_secs),
+                g_5h_theme,
+                if m.gemini_calls_5h > 0 && !m.gemini_reset_5h_label.is_empty() {
+                    format!(
+                        "{} calls in 5h · resets in {}",
+                        m.gemini_calls_5h, m.gemini_reset_5h_label
+                    )
+                } else {
+                    "0 calls in last 5h · full 5:00 window ready".to_owned()
+                },
+                p,
+            )
+            .into_any_element()
+        };
+
+        let cg_detail_meter: AnyElement = if let Some(q) = sq {
+            let cg5_reset = q
+                .claude_gpt_5h
+                .as_ref()
+                .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+            let cgwk_reset = q
+                .claude_gpt_weekly
+                .as_ref()
+                .and_then(|b| format_reset_countdown_from_iso(&b.reset_at, now_utc));
+            div()
+                .flex()
+                .flex_col()
+                .gap(px(8.0))
+                .child(render_server_quota_bar_row(
+                    "5-HOUR LIMIT",
+                    m.claude_gpt_remaining_5h_pct,
+                    cg5_reset,
+                    server_pct_theme(m.claude_gpt_remaining_5h_pct, PhosphorTheme::Emerald),
+                    16,
+                    13.0,
+                    p,
+                ))
+                .child(render_server_quota_bar_row(
+                    "WEEKLY LIMIT",
+                    m.claude_gpt_remaining_7d_pct,
+                    cgwk_reset,
+                    server_pct_theme(m.claude_gpt_remaining_7d_pct, PhosphorTheme::Emerald),
+                    16,
+                    13.0,
+                    p,
+                ))
+                .into_any_element()
+        } else {
+            render_timer_pool_row(
+                "5-HOUR ROLLING TIMER",
+                &cg_clock,
+                timer_unit_label(cg_secs, acc.is_on_cooldown),
+                window_5h_fraction(cg_secs),
+                cg_5h_theme,
+                if cg_5h_calls > 0 && !m.claude_gpt_reset_5h_label.is_empty() {
+                    format!(
+                        "{cg_5h_calls} calls in 5h · resets in {}",
+                        m.claude_gpt_reset_5h_label
+                    )
+                } else {
+                    "0 calls in last 5h · full 5:00 window ready".to_owned()
+                },
+                p,
+            )
+            .into_any_element()
+        };
 
         let left_pools = div()
             .flex_1()
@@ -2448,23 +2691,8 @@ impl AgSwitchView {
                                     )),
                             ),
                     )
-                    // 5h Local Rolling Timer
-                    .child(render_timer_pool_row(
-                        "5-HOUR ROLLING TIMER",
-                        &g_clock,
-                        timer_unit_label(g_secs, acc.is_on_cooldown),
-                        window_5h_fraction(g_secs),
-                        g_5h_theme,
-                        if m.gemini_calls_5h > 0 && !m.gemini_reset_5h_label.is_empty() {
-                            format!(
-                                "{} calls in 5h · resets in {}",
-                                m.gemini_calls_5h, m.gemini_reset_5h_label
-                            )
-                        } else {
-                            "0 calls in last 5h · full 5:00 window ready".to_owned()
-                        },
-                        p,
-                    ))
+                    // Dual 5h+Weekly live server quota bars OR local 5h rolling timer
+                    .child(g_detail_meter)
                     // 7-Day Exact Local Volume
                     .child(
                         div()
@@ -2541,22 +2769,7 @@ impl AgSwitchView {
                                     )),
                             ),
                     )
-                    .child(render_timer_pool_row(
-                        "5-HOUR ROLLING TIMER",
-                        &cg_clock,
-                        timer_unit_label(cg_secs, acc.is_on_cooldown),
-                        window_5h_fraction(cg_secs),
-                        cg_5h_theme,
-                        if cg_5h_calls > 0 && !m.claude_gpt_reset_5h_label.is_empty() {
-                            format!(
-                                "{cg_5h_calls} calls in 5h · resets in {}",
-                                m.claude_gpt_reset_5h_label
-                            )
-                        } else {
-                            "0 calls in last 5h · full 5:00 window ready".to_owned()
-                        },
-                        p,
-                    ))
+                    .child(cg_detail_meter)
                     .child(
                         div()
                             .pt(px(8.0))
@@ -5023,6 +5236,81 @@ fn percent_to_f32_fraction(pct: f64) -> f32 {
     let clamped = pct.clamp(0.0, 100.0);
     let parsed: f32 = format!("{clamped:.1}").parse().unwrap_or(0.0);
     (parsed / 100.0).clamp(0.0, 1.0)
+}
+
+fn server_pct_theme(pct: f64, base: PhosphorTheme) -> PhosphorTheme {
+    if pct <= 5.0 {
+        PhosphorTheme::Red
+    } else if pct <= 25.0 {
+        PhosphorTheme::Amber
+    } else {
+        base
+    }
+}
+
+fn render_server_quota_bar_row(
+    label: &'static str,
+    remaining_pct: f64,
+    reset_countdown: Option<String>,
+    theme: PhosphorTheme,
+    segments: u8,
+    bar_height: f32,
+    p: &SamoPalette,
+) -> impl IntoElement + use<> {
+    let bar = segmented_led_bar(
+        segments,
+        percent_to_f32_fraction(remaining_pct),
+        theme,
+        p.led_unlit,
+        bar_height,
+        5.0,
+        2.5,
+    );
+    let pct_text = format!("{remaining_pct:.0}% left");
+    let reset_text = reset_countdown
+        .map(|r| format!("Resets in {r}"))
+        .unwrap_or_default();
+
+    div()
+        .flex()
+        .flex_col()
+        .gap(px(3.0))
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .justify_between()
+                .gap(px(6.0))
+                .child(
+                    div()
+                        .text_size(px(9.0))
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(p.text_muted)
+                        .child(label),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap(px(6.0))
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(px(9.0))
+                                .text_color(p.text_muted)
+                                .child(reset_text),
+                        )
+                        .child(
+                            div()
+                                .whitespace_nowrap()
+                                .text_size(px(9.5))
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_color(p.text_primary)
+                                .child(pct_text),
+                        ),
+                ),
+        )
+        .child(bar)
 }
 
 fn timer_bar_theme(

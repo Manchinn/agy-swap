@@ -1332,7 +1332,7 @@ pub fn match_external_quota<'a>(
         return Some(found);
     }
 
-    // 3. Name match against connection name
+    // 3. Strict name match against connection name
     if !name.is_empty()
         && let Some(found) = quotas
             .iter()
@@ -1341,12 +1341,23 @@ pub fn match_external_quota<'a>(
         return Some(found);
     }
 
-    // 4. Single-quota fallback for primary profile when only one external quota entry exists
-    if profile.is_default_profile && quotas.len() == 1 {
-        return quotas.first();
-    }
-
+    // Strict-match only: never fall back to an unrelated external account
     None
+}
+
+/// Format an RFC3339 reset timestamp into a compact human countdown (`5d 18h`, `2h 19m`, `42m`).
+pub fn format_reset_countdown_from_iso(iso: &str, now: DateTime<Utc>) -> Option<String> {
+    let secs = parse_reset_secs(iso, now)?;
+    let days = secs / 86_400;
+    let hours = (secs % 86_400) / 3_600;
+    let mins = (secs % 3_600) / 60;
+    if days > 0 {
+        Some(format!("{days}d {hours}h"))
+    } else if hours > 0 {
+        Some(format!("{hours}h {mins}m"))
+    } else {
+        Some(format!("{}m", mins.max(1)))
+    }
 }
 
 /// Overlay exact server-side Antigravity quota percentages & reset timers onto a `ModelUsageBreakdown`.
@@ -1691,10 +1702,22 @@ mod tests {
             .ok_or_else(|| "expected quota match".to_owned())?;
         assert!(is_server_quota_exhausted(matched));
 
+        // Strict-match guarantee: Primary Account with no matching email must NOT bind to alpha@example.com
+        let primary = AccountProfile::create_default();
+        assert!(match_external_quota(&primary, &parsed.antigravity_quotas).is_none());
+
         let now = Utc
             .with_ymd_and_hms(2026, 11, 25, 14, 0, 0)
             .single()
             .ok_or_else(|| "invalid ts".to_owned())?;
+        assert_eq!(
+            format_reset_countdown_from_iso("2026-12-01T08:00:00Z", now).as_deref(),
+            Some("5d 18h")
+        );
+        assert_eq!(
+            format_reset_countdown_from_iso("2026-11-25T16:30:00Z", now).as_deref(),
+            Some("2h 30m")
+        );
         let mut models = ModelUsageBreakdown::default();
         apply_server_quota_overlay(&mut models, matched, now);
         assert!((models.gemini_remaining_5h_pct - 72.5).abs() < 0.01);
